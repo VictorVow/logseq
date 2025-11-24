@@ -716,7 +716,7 @@
             (when-not (or whiteboard? tag-dialog? linked-refs? (and block? (not db-based?)))
               [:div.fade-in.delay {:key "page-references"}
                (ui/foldable
-                [:div] ; Empty div - not shown due to class below  
+                [:div] ; Empty div - minimal header to avoid duplication with inner view
                 (fn []
                   (rum/with-key
                     (reference/references page {:sidebar? sidebar?
