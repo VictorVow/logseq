@@ -716,14 +716,15 @@
             (when-not (or whiteboard? tag-dialog? linked-refs? (and block? (not db-based?)))
               [:div.fade-in.delay {:key "page-references"}
                (ui/foldable
-                [:h2.font-medium.opacity-70 "Linked References"]
+                [:div] ; Empty div - not shown due to class below  
                 (fn []
                   (rum/with-key
                     (reference/references page {:sidebar? sidebar?
                                                 :journals? journals?
                                                 :refs-count (:refs-count option)})
                     (str title "-refs")))
-                {:default-collapsed? (= 0 (state/get-ref-open-blocks-level))})])
+                {:default-collapsed? (= 0 (state/get-ref-open-blocks-level))
+                 :class "lazy-ref-wrapper"})])
 
             (when-not block-or-whiteboard?
               (when (and (not journal?) (not db-based?))
