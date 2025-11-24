@@ -737,7 +737,7 @@
                           (and block? (not db-based?)))
               [:div.fade-in.delay {:key "page-unlinked-references"}
                (ui/foldable
-                [:h2.font-medium.opacity-70 "Unlinked References"]
+                [:div.font-medium.text-sm [:span "Unlinked references"]]
                 (fn []
                   (reference/unlinked-references page {:sidebar? sidebar?}))
                 {:default-collapsed? true})])])])
