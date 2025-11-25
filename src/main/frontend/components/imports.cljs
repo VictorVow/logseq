@@ -1,7 +1,6 @@
 (ns frontend.components.imports
   "Import data into Logseq."
   (:require [cljs-time.core :as t]
-            [cljs.pprint :as pprint]
             [clojure.string :as string]
             [datascript.core :as d]
             [frontend.components.onboarding.setups :as setups]
@@ -288,6 +287,21 @@
 
                           (shui/button {:type "submit" :class "right-0 mt-3"} "Submit")]))])
 
+(defn- pprint-limited
+  "Log items with a limit to avoid blocking the UI with large output.
+   Uses simple string representation instead of pprint to avoid UI blocking."
+  [items limit label]
+  (let [item-count (count items)
+        items-to-show (take limit items)
+        truncated? (> item-count limit)]
+    (when truncated?
+      (log/info :output-truncated {:msg (str "Showing first " limit " of " item-count " " label ":")}))
+    ;; Use simple logging instead of pprint to avoid UI blocking
+    (doseq [item items-to-show]
+      (js/console.log (pr-str item)))
+    (when truncated?
+      (log/info :output-truncated-notice {:msg (str "... and " (- item-count limit) " more " label " (not shown to avoid blocking UI)")}))))
+
 (defn- validate-imported-data
   [db import-state files]
   (when-let [org-files (seq (filter #(= "org" (path/file-ext (:path %))) files))]
@@ -300,14 +314,28 @@
                              ". See the javascript console for more details.")
                         :info false)
     (log/error :import-ignored-files {:msg (str "Import ignored " (count ignored-files) " file(s)")})
-    (pprint/pprint ignored-files))
+    (pprint-limited ignored-files 20 "ignored files"))
+  (when-let [ignored-pages (seq @(:ignored-pages import-state))]
+    (notification/show! (str "Import skipped " (count ignored-pages) " "
+                             (if (= 1 (count ignored-pages)) "page" "pages")
+                             " due to errors. See the javascript console for more details.")
+                        :warning false)
+    (log/error :import-ignored-pages {:msg (str "Import skipped " (count ignored-pages) " page(s)")})
+    (pprint-limited ignored-pages 20 "ignored pages"))
+  (when-let [ignored-blocks (seq @(:ignored-blocks import-state))]
+    (notification/show! (str "Import skipped " (count ignored-blocks) " "
+                             (if (= 1 (count ignored-blocks)) "block" "blocks")
+                             " due to errors. See the javascript console for more details.")
+                        :warning false)
+    (log/error :import-ignored-blocks {:msg (str "Import skipped " (count ignored-blocks) " block(s)")})
+    (pprint-limited ignored-blocks 20 "ignored blocks"))
   (when-let [ignored-assets (seq @(:ignored-assets import-state))]
     (notification/show! (str "Import ignored " (count ignored-assets) " "
                              (if (= 1 (count ignored-assets)) "asset" "assets")
                              ". See the javascript console for more details.")
                         :info false)
     (log/error :import-ignored-assets {:msg (str "Import ignored " (count ignored-assets) " asset(s)")})
-    (pprint/pprint ignored-assets))
+    (pprint-limited ignored-assets 20 "ignored assets"))
   (when-let [ignored-props (seq @(:ignored-properties import-state))]
     (notification/show!
      [:.mb-2
@@ -335,7 +363,7 @@
       (do
         (log/error :import-errors {:msg (str "Import detected " (count errors) " invalid block(s):")
                                    :counts (assoc (db-validate/graph-counts db entities) :datoms datom-count)})
-        (pprint/pprint errors)
+        (pprint-limited errors 20 "validation errors")
         (notification/show! (str "Import detected " (count errors) " invalid block(s). These blocks may be buggy when you interact with them. See the javascript console for more.")
                             :warning false))
       (log/info :import-valid {:msg "Valid import!"
@@ -398,6 +426,11 @@
                    ;; common options
                    :notify-user show-notification
                    :set-ui-state state/set-state!
+                   :log-fn (fn [tag & args]
+                             (let [data (if (and (= 1 (count args)) (map? (first args)))
+                                          (first args)
+                                          (apply hash-map args))]
+                               (log/info tag data)))
                    :<read-file (fn <read-file [file] (.text (:file-object file)))
                    ;; config file options
                    :default-config config/config-default-content
@@ -417,10 +450,13 @@
                                       (db-browser/transact! repo (:tx-data tx-report) (:tx-meta tx-report)))))}
           {:keys [files import-state]} (gp-exporter/export-file-graph repo db-conn config-file *files options)]
     (log/info :import-file-graph {:msg (str "Import finished in " (/ (t/in-millis (t/interval start-time (t/now))) 1000) " seconds")})
+    (log/info :import-validation-start {})
     (state/set-state! :graph/importing nil)
     (state/set-state! :graph/importing-state nil)
     (validate-imported-data @db-conn import-state files)
+    (log/info :import-validation-complete {})
     (state/pub-event! [:graph/ready (state/get-current-repo)])
+    (log/info :import-graph-ready {})
     (finished-cb)))
 
 (defn import-file-to-db-handler

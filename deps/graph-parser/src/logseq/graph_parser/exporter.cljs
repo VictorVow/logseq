@@ -288,7 +288,7 @@
                       "CANCELLED" :logseq.property/status.canceled}
           status-ident (or (old-to-new marker)
                            (do
-                             (log-fn :invalid-todo (str (pr-str marker) " is not a valid marker so setting it to TODO"))
+                             (log-fn :invalid-todo {:msg (str (pr-str marker) " is not a valid marker so setting it to TODO")})
                              :logseq.property/status.todo))]
       (-> block
           (assoc :logseq.property/status status-ident)
@@ -305,7 +305,7 @@
                       "C" :logseq.property/priority.low}
           priority-value (or (old-to-new priority)
                              (do
-                               (log-fn :invalid-priority (str (pr-str priority) " is not a valid priority so setting it to low"))
+                               (log-fn :invalid-priority {:msg (str (pr-str priority) " is not a valid priority so setting it to low")})
                                :logseq.property/priority.low))]
       (-> block
           (assoc :logseq.property/priority priority-value)
@@ -775,12 +775,29 @@
                                           class-m' (merge class-m
                                                           {:block/uuid (find-or-gen-class-uuid page-names-to-uuids (common-util/page-name-sanity-lc new-class) (:db/ident class-m))})]
                                       (when (> (count parent-classes-from-properties) 1)
-                                        (log-fn :skipped-parent-classes "Only one parent class is allowed so skipped ones after the first one" :classes parent-classes-from-properties))
+                                        (log-fn :skipped-parent-classes {:msg "Only one parent class is allowed so skipped ones after the first one" :classes parent-classes-from-properties}))
                                       (when (:new-class? (meta class-m)) (swap! classes-tx conj class-m'))
                                       [:block/uuid (:block/uuid class-m')])))]
             class-m')
           (replace-namespace-with-parent block page-names-to-uuids :block/parent))]
     {:block block' :properties-tx properties-tx}))
+
+(defn- safe-handle-page-properties
+  "Wrapper around handle-page-properties that catches exceptions and logs invalid pages
+   instead of failing the entire import. Returns nil for pages that fail to process."
+  [page db per-file-state all-pages {:keys [import-state log-fn file] :as options}]
+  (try
+    (handle-page-properties page db per-file-state all-pages options)
+    (catch :default e
+      (let [title-str (str (:block/title page))
+            page-info {:block/name (:block/name page)
+                       :block/title (subs title-str 0 (min 100 (count title-str)))
+                       :reason (.-message e)
+                       :file file
+                       :error (ex-data e)}]
+        (log-fn :ignored-page {:msg "Page failed to import and was skipped" :page-info page-info})
+        (swap! (:ignored-pages import-state) conj page-info)
+        nil))))
 
 (defn- pretty-print-dissoc
   "Remove list of keys from a given map string while preserving whitespace"
@@ -881,7 +898,7 @@
               (extract-block-list (second node))
               :else
               (do
-                (log-fn :ast->text "Ignored ast node" :node node)
+                (log-fn :ast->text {:msg "Ignored ast node" :node node})
                 []))))]
     (->> (extract ast-block)
         ;;  ((fn [x] (prn :X x) x))
@@ -1068,8 +1085,8 @@
          :logseq.property.pdf/hl-page (:page m)
          :block/title (get-in m [:content :text])}
         _ (when (some (comp nil? val) user-attributes)
-            (log-fn :missing-annotation-attributes "Annotation is missing some attributes so set reasonable defaults for them"
-                    {:annotation user-attributes :asset (:block/title parent-asset)}))
+            (log-fn :missing-annotation-attributes {:msg "Annotation is missing some attributes so set reasonable defaults for them"
+                    :annotation user-attributes :asset (:block/title parent-asset)}))
         asset-image-uuid (some (fn [[asset-name image-uuid]]
                                  (when (string/includes? asset-name
                                                          (str (:id m)
@@ -1258,7 +1275,7 @@
                 :block/link [:block/uuid block-uuid]}))
       :else
       (do
-        (log-fn :invalid-embed-arguments "Ignore embed because of invalid arguments" :args (:arguments (second embed-node)))
+        (log-fn :invalid-embed-arguments {:msg "Ignore embed because of invalid arguments" :args (:arguments (second embed-node))})
         block))
     block))
 
@@ -1294,6 +1311,23 @@
                    )]
     ;; Order matters as previous txs are referenced in block
     (concat properties-tx deadline-properties-tx asset-blocks-tx [block'])))
+
+(defn- safe-build-block-tx
+  "Wrapper around build-block-tx that catches exceptions and logs invalid blocks
+   instead of failing the entire import. Returns empty seq for blocks that fail to build."
+  [db block* pre-blocks per-file-state {:keys [import-state log-fn file] :as options}]
+  (try
+    (build-block-tx db block* pre-blocks per-file-state options)
+    (catch :default e
+      (let [title-str (str (:block/title block*))
+            block-info {:block/uuid (:block/uuid block*)
+                        :block/title (subs title-str 0 (min 100 (count title-str)))
+                        :reason (.-message e)
+                        :file file
+                        :error (ex-data e)}]
+        (log-fn :ignored-block {:msg "Block failed to import and was skipped" :block-info block-info})
+        (swap! (:ignored-blocks import-state) conj block-info)
+        []))))
 
 (defn- update-page-alias
   [m page-names-to-uuids]
@@ -1431,8 +1465,9 @@
         page-names-to-uuids (atom (merge all-existing-page-uuids all-new-page-uuids))
         per-file-state {:page-names-to-uuids page-names-to-uuids
                         :classes-tx (:classes-tx options)}
-        all-pages-m (mapv #(handle-page-properties % @conn per-file-state all-pages options)
-                          all-pages)
+        all-pages-m (->> all-pages
+                         (mapv #(safe-handle-page-properties % @conn per-file-state all-pages options))
+                         (remove nil?))
         pages-tx (keep (fn [{m :block _properties-tx :properties-tx}]
                          (let [page (if-let [page-uuid (if (::original-name m)
                                                          (all-existing-page-uuids (::original-name m))
@@ -1502,7 +1537,7 @@
   (if (seq upstream-properties)
     (let [block-properties-text-values @(:block-properties-text-values import-state)
           all-idents @(:all-idents import-state)
-          _ (log-fn :props-upstream-to-change upstream-properties)
+          _ (log-fn :props-upstream-to-change {:properties upstream-properties})
           txs
           (mapcat
            (fn [[prop {:keys [schema from-type]}]]
@@ -1530,6 +1565,12 @@
    :ignored-files (atom [])
    ;; Vec of maps with keys :path, :reason and :location (optional).
    :ignored-assets (atom [])
+   ;; Vec of maps with keys :block/uuid, :block/title, :reason, :file and optionally :error.
+   ;; Blocks are ignored when they fail to import due to errors
+   :ignored-blocks (atom [])
+   ;; Vec of maps with keys :block/name, :block/title, :reason, :file and optionally :error.
+   ;; Pages are ignored when they fail to import due to errors
+   :ignored-pages (atom [])
    ;; Map of annotation page paths and their parsed contents
    :pdf-annotation-pages (atom {})
    ;; Map of property names (keyword) and their current schemas (map of qualified properties).
@@ -1790,8 +1831,8 @@
         pre-blocks (->> blocks (keep #(when (:block/pre-block? %) (:block/uuid %))) set)
         blocks-tx (->> blocks
                        (remove :block/pre-block?)
-                       (mapcat #(build-block-tx @conn % pre-blocks per-file-state
-                                                (assoc tx-options :whiteboard? (some? (seq whiteboard-pages)))))
+                       (mapcat #(safe-build-block-tx @conn % pre-blocks per-file-state
+                                                     (assoc tx-options :whiteboard? (some? (seq whiteboard-pages)))))
                        vec)
         {:keys [property-pages-tx property-page-properties-tx] pages-tx' :pages-tx}
         (split-pages-and-properties-tx pages-tx old-properties existing-pages (:import-state options) @(:upstream-properties tx-options))
@@ -1840,17 +1881,39 @@
 
 (defn- export-doc-file
   [{:keys [path idx] :as file} conn <read-file
-   {:keys [notify-user set-ui-state export-file]
+   {:keys [notify-user set-ui-state export-file log-fn import-state]
     :or {set-ui-state (constantly nil)
+         log-fn prn
          export-file (fn export-file [conn m opts]
                        (add-file-to-db-graph conn (:file/path m) (:file/content m) opts))}
     :as options}]
-  ;; (prn :export-doc-file path idx)
+  (log-fn :import-file-start {:file path :idx (inc idx)})
   (-> (p/let [_ (set-ui-state [:graph/importing-state :current-idx] (inc idx))
               _ (set-ui-state [:graph/importing-state :current-page] path)
               content (<read-file file)
-              m {:file/path path :file/content content}]
+              m {:file/path path :file/content content}
+              ignored-blocks-before (if import-state (count @(:ignored-blocks import-state)) 0)
+              ignored-pages-before (if import-state (count @(:ignored-pages import-state)) 0)]
         (export-file conn m (dissoc options :set-ui-state :export-file))
+        ;; Log file completion and any issues
+        (let [ignored-blocks-after (if import-state (count @(:ignored-blocks import-state)) 0)
+              ignored-pages-after (if import-state (count @(:ignored-pages import-state)) 0)
+              new-ignored-blocks (- ignored-blocks-after ignored-blocks-before)
+              new-ignored-pages (- ignored-pages-after ignored-pages-before)]
+          (if (and (zero? new-ignored-blocks) (zero? new-ignored-pages))
+            (log-fn :import-file-complete {:file path})
+            (let [issues-parts (cond-> []
+                                 (pos? new-ignored-blocks)
+                                 (conj (str new-ignored-blocks " skipped block(s)"))
+                                 (pos? new-ignored-pages)
+                                 (conj (str new-ignored-pages " skipped page(s)")))]
+              (log-fn :import-file-complete-with-issues {:file path
+                                                         :ignored-blocks new-ignored-blocks
+                                                         :ignored-pages new-ignored-pages})
+              (notify-user {:msg (str "File " (pr-str path) " imported with "
+                                      (string/join " and " issues-parts)
+                                      ". See console for details.")
+                            :level :warning}))))
         ;; returning val results in smoother ui updates
         m)
       (p/catch (fn [error]
@@ -1861,9 +1924,10 @@
 (defn export-doc-files
   "Exports all user created files i.e. under journals/ and pages/.
    Recommended to use build-doc-options and pass that as options"
-  [conn *doc-files <read-file {:keys [notify-user set-ui-state]
-                               :or {set-ui-state (constantly nil) notify-user prn}
+  [conn *doc-files <read-file {:keys [notify-user set-ui-state log-fn]
+                               :or {set-ui-state (constantly nil) notify-user prn log-fn prn}
                                :as options}]
+  (log-fn :import-doc-files-start {:total (count *doc-files)})
   (set-ui-state [:graph/importing-state :total] (count *doc-files))
   (let [doc-files (mapv #(assoc %1 :idx %2)
                         ;; Sort files to ensure reproducible import behavior
@@ -1877,6 +1941,8 @@
           (when-not (>= i (dec (count doc-files)))
             (p/recur (export-doc-file (get doc-files (inc i)) conn <read-file options)
                      (inc i))))
+        (p/then (fn [_]
+                  (log-fn :import-doc-files-complete {:total (count *doc-files)})))
         (p/catch (fn [e]
                    (notify-user {:msg (str "Import has unexpected error:\n" (.-message e))
                                  :level :error
@@ -1930,32 +1996,40 @@
                  (edn/read-string default-config)))))
 
 (defn- export-class-properties
-  [conn repo-or-conn]
-  (let [user-classes (->> (d/q '[:find (pull ?b [:db/id :db/ident])
-                                 :where [?b :block/tags :logseq.class/Tag]] @conn)
-                          (map first)
-                          (remove #(db-class/built-in-classes (:db/ident %))))
-        class-to-prop-uuids
-        (->> (d/q '[:find ?t ?prop #_?class
-                    :in $ ?user-classes
-                    :where
-                    [?b :block/tags ?t]
-                    [?t :db/ident ?class]
-                    [(contains? ?user-classes ?class)]
-                    [?b ?prop _]
-                    [?prop-e :db/ident ?prop]
-                    [?prop-e :block/tags :logseq.class/Property]]
-                  @conn
-                  (set (map :db/ident user-classes)))
-             (remove #(ldb/built-in? (d/entity @conn (second %))))
-             (reduce (fn [acc [class-id prop-ident]]
-                       (update acc class-id (fnil conj #{}) prop-ident))
-                     {}))
-        tx (mapv (fn [[class-id prop-ids]]
-                   {:db/id class-id
-                    :logseq.property.class/properties (vec prop-ids)})
-                 class-to-prop-uuids)]
-    (ldb/transact! repo-or-conn tx)))
+  "Export class properties. Wrapped in try-catch to prevent import from hanging on errors."
+  [conn repo-or-conn {:keys [log-fn] :or {log-fn prn}}]
+  (try
+    (log-fn :export-class-properties-start {})
+    (let [user-classes (->> (d/q '[:find (pull ?b [:db/id :db/ident])
+                                   :where [?b :block/tags :logseq.class/Tag]] @conn)
+                            (map first)
+                            (remove #(db-class/built-in-classes (:db/ident %))))
+          _ (log-fn :export-class-properties-classes {:count (count user-classes)})
+          class-to-prop-uuids
+          (->> (d/q '[:find ?t ?prop #_?class
+                      :in $ ?user-classes
+                      :where
+                      [?b :block/tags ?t]
+                      [?t :db/ident ?class]
+                      [(contains? ?user-classes ?class)]
+                      [?b ?prop _]
+                      [?prop-e :db/ident ?prop]
+                      [?prop-e :block/tags :logseq.class/Property]]
+                    @conn
+                    (set (map :db/ident user-classes)))
+               (remove #(ldb/built-in? (d/entity @conn (second %))))
+               (reduce (fn [acc [class-id prop-ident]]
+                         (update acc class-id (fnil conj #{}) prop-ident))
+                       {}))
+          tx (mapv (fn [[class-id prop-ids]]
+                     {:db/id class-id
+                      :logseq.property.class/properties (vec prop-ids)})
+                   class-to-prop-uuids)]
+      (ldb/transact! repo-or-conn tx)
+      (log-fn :export-class-properties-complete {:tx-count (count tx)}))
+    (catch :default e
+      (log-fn :export-class-properties-error {:error (.-message e)})
+      (js/console.error "Error in export-class-properties:" e))))
 
 (defn- <safe-async-loop
   "Calls async-fn with each element in args-to-loop. Catches an unexpected error in loop and notifies user"
@@ -2024,16 +2098,23 @@
 
 (defn- export-favorites-from-config-edn
   [conn repo config {:keys [log-fn] :or {log-fn prn}}]
-  (when-let [favorites (seq (:favorites config))]
-    (p/do!
-     (if-let [favorited-ids
-              (keep (fn [page-name]
-                      (some-> (ldb/get-page @conn page-name)
-                              :block/uuid))
-                    favorites)]
-       (let [page-entity (ldb/get-page @conn common-config/favorites-page-name)]
-         (insert-favorites repo favorited-ids (:db/id page-entity)))
-       (log-fn :no-favorites-found {:favorites favorites})))))
+  (try
+    (log-fn :export-favorites-start {})
+    (when-let [favorites (seq (:favorites config))]
+      (p/do!
+       (if-let [favorited-ids
+                (keep (fn [page-name]
+                        (some-> (ldb/get-page @conn page-name)
+                                :block/uuid))
+                      favorites)]
+         (let [page-entity (ldb/get-page @conn common-config/favorites-page-name)
+               _ (log-fn :export-favorites-found {:count (count favorited-ids)})]
+           (insert-favorites repo favorited-ids (:db/id page-entity))
+           (log-fn :export-favorites-complete {}))
+         (log-fn :no-favorites-found {:favorites favorites}))))
+    (catch :default e
+      (log-fn :export-favorites-error {:error (.-message e)})
+      (js/console.error "Error in export-favorites-from-config-edn:" e))))
 
 (defn build-doc-options
   "Builds options for use with export-doc-files and assets"
@@ -2050,24 +2131,32 @@
       (merge (select-keys options [:set-ui-state :export-file :notify-user]))))
 
 (defn- move-top-parent-pages-to-library
-  [conn repo-or-conn]
-  (let [db @conn
-        library-page (ldb/get-built-in-page db common-config/library-page-name)
-        library-id (:block/uuid library-page)
-        top-parent-pages (->> (d/datoms db :avet :block/parent)
-                              (keep (fn [d]
-                                      (let [child (d/entity db (:e d))
-                                            parent (d/entity db (:v d))]
-                                        (when (and (nil? (:block/parent parent)) (ldb/page? child) (ldb/page? parent))
-                                          parent))))
-                              (common-util/distinct-by :block/uuid))
-        tx-data (map
-                 (fn [parent]
-                   {:db/id (:db/id parent)
-                    :block/parent [:block/uuid library-id]
-                    :block/order (db-order/gen-key)})
-                 top-parent-pages)]
-    (ldb/transact! repo-or-conn tx-data)))
+  "Move top parent pages to library. Wrapped in try-catch to prevent import from hanging on errors."
+  [conn repo-or-conn {:keys [log-fn] :or {log-fn prn}}]
+  (try
+    (log-fn :move-top-parent-pages-start {})
+    (let [db @conn
+          library-page (ldb/get-built-in-page db common-config/library-page-name)
+          library-id (:block/uuid library-page)
+          top-parent-pages (->> (d/datoms db :avet :block/parent)
+                                (keep (fn [d]
+                                        (let [child (d/entity db (:e d))
+                                              parent (d/entity db (:v d))]
+                                          (when (and (nil? (:block/parent parent)) (ldb/page? child) (ldb/page? parent))
+                                            parent))))
+                                (common-util/distinct-by :block/uuid))
+          _ (log-fn :move-top-parent-pages-found {:count (count top-parent-pages)})
+          tx-data (map
+                   (fn [parent]
+                     {:db/id (:db/id parent)
+                      :block/parent [:block/uuid library-id]
+                      :block/order (db-order/gen-key)})
+                   top-parent-pages)]
+      (ldb/transact! repo-or-conn tx-data)
+      (log-fn :move-top-parent-pages-complete {:tx-count (count tx-data)}))
+    (catch :default e
+      (log-fn :move-top-parent-pages-error {:error (.-message e)})
+      (js/console.error "Error in move-top-parent-pages-to-library:" e))))
 
 (defn export-file-graph
   "Main fn which exports a file graph given its files and imports them
@@ -2104,7 +2193,7 @@
                           (filter #(contains? #{"md" "org" "markdown" "edn"} (path/file-ext (:path %)))))
            asset-files (filter asset-file? files)
            doc-options (build-doc-options config options)]
-       (log-fn "Importing" (count doc-files) "files ...")
+       (log-fn :import-starting {:msg (str "Importing " (count doc-files) " files ...")})
        ;; These export* fns are all the major export/import steps
        (p/do!
         (export-logseq-files repo-or-conn (filter logseq-file? files) <read-file
@@ -2116,9 +2205,9 @@
                                    (merge (select-keys options [:notify-user :set-ui-state :rpath-key])
                                           {:assets (get-in doc-options [:import-state :assets])}))
         (export-doc-files conn doc-files <read-file doc-options)
-        (export-favorites-from-config-edn conn repo-or-conn config {})
-        (export-class-properties conn repo-or-conn)
-        (move-top-parent-pages-to-library conn repo-or-conn)
+        (export-favorites-from-config-edn conn repo-or-conn config {:log-fn log-fn})
+        (export-class-properties conn repo-or-conn {:log-fn log-fn})
+        (move-top-parent-pages-to-library conn repo-or-conn {:log-fn log-fn})
         {:import-state (-> (:import-state doc-options)
                            ;; don't leak full asset content (which could be large) out of this ns
                            (dissoc :assets))
