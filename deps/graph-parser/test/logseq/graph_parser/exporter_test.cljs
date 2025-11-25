@@ -587,6 +587,12 @@
     (testing "multiline blocks"
       (is (= "|markdown| table|\n|some|thing|" (:block/title (db-test/find-block-by-content @conn #"markdown.*table"))))
       (is (= "multiline block\na 2nd\nand a 3rd" (:block/title (db-test/find-block-by-content @conn #"multiline block"))))
+      (is (= "[FP](https://en.wikipedia.org/wiki/Functional_programming)\nAKA Functional Programming"
+             (:block/title (db-test/find-block-by-content @conn #"FP.*Functional")))
+          "Block starting with a link followed by multiline content")
+      (is (= "Wireframing\nAKA Create UI mockups"
+             (:block/title (db-test/find-block-by-content @conn #"Wireframing")))
+          "Block with properties followed by multiline content")
       (is (= "logbook block" (:block/title (db-test/find-block-by-content @conn #"logbook block")))))
 
     (testing ":block/refs"
