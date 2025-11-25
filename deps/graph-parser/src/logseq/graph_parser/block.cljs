@@ -747,10 +747,15 @@
 
                 (heading-block? ast-block)
                 ;; for db-graphs cut multi-line when there is property, deadline/scheduled or logbook text in :block/title
-                (let [cut-multiline? (and export-to-db-graph?
+                ;; but preserve multiline when there's regular paragraph content after properties
+                (let [has-body-paragraph? (some #(and (= "Paragraph" (first %))
+                                                      (not (seq (set/intersection (set (flatten %)) #{"Deadline" "Scheduled"}))))
+                                                body)
+                      cut-multiline? (and export-to-db-graph?
                                           (when-let [prev-block (first (get all-blocks (dec block-idx)))]
                                             (or (and (gp-property/properties-ast? prev-block)
-                                                     (not= "Custom" (ffirst (get all-blocks (- block-idx 2)))))
+                                                     (not= "Custom" (ffirst (get all-blocks (- block-idx 2))))
+                                                     (not has-body-paragraph?))
                                                 (= ["Drawer" "logbook"] (take 2 prev-block))
                                                 (and (= "Paragraph" (first prev-block))
                                                      (seq (set/intersection (set (flatten prev-block)) #{"Deadline" "Scheduled"}))))))
