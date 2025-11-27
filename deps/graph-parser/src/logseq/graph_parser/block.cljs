@@ -766,12 +766,15 @@
                                          (if (seq headings)
                                            (get-in (last headings) [:meta :start_pos])
                                            nil)))
-                      ;; Remove properties text from custom queries in db graphs
+                      ;; Remove properties text from blocks in db graphs
+                      ;; For custom queries, check if properties precede the query
+                      ;; For all other blocks in db graphs, always remove properties from title
                       options' (assoc options
                                       :remove-properties?
                                       (and export-to-db-graph?
-                                           (and (gp-property/properties-ast? (first (get all-blocks (dec block-idx))))
-                                                (= "Custom" (ffirst (get all-blocks (- block-idx 2)))))))
+                                           (or (seq (:properties properties))
+                                               (and (gp-property/properties-ast? (first (get all-blocks (dec block-idx))))
+                                                    (= "Custom" (ffirst (get all-blocks (- block-idx 2))))))))
                       block' (construct-block ast-block properties timestamps body encoded-content format pos-meta' options')
                       block'' (cond
                                 db-graph-mode?
