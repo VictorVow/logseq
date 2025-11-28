@@ -267,7 +267,11 @@
                       (map (fn [b] (dissoc b :block.temp/ast-title :block.temp/ast-body :block/level :block/children :block/meta))))]
       [pages blocks])
     (catch :default e
-      (log/error :exception e))))
+      (log/error :extract-pages-and-blocks-error {:exception e :file file})
+      ;; Re-throw with context so the error is visible and can be handled upstream
+      (throw (ex-info (str "Failed to extract pages and blocks from file: " file)
+                      {:file file}
+                      e)))))
 
 (defn extract
   "Extracts pages, blocks and ast from given file"
