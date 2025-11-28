@@ -1811,12 +1811,25 @@
 * :macros - map of macros for use with macro expansion
 * :notify-user - Displays warnings to user without failing the import. Fn receives a map with :msg
 * :log-fn - Logs messages for development. Defaults to prn"
-  [conn file content {:keys [notify-user log-fn]
+  [conn file content {:keys [notify-user log-fn import-state]
                       :or {notify-user #(println "[WARNING]" (:msg %))
                            log-fn prn}
                       :as *options}]
   (let [options (assoc *options :notify-user notify-user :log-fn log-fn :file file)
         {:keys [pages blocks]} (extract-pages-and-blocks @conn file content options)
+        ;; Log warning if file produced no pages or blocks (silent failure)
+        _ (when (and (empty? pages) (empty? blocks) (not (string/blank? content)))
+            (let [content-preview (subs content 0 (min 200 (count content)))]
+              (log-fn :import-file-empty-result {:msg "File was parsed but produced no pages or blocks"
+                                                  :file file
+                                                  :content-length (count content)
+                                                  :content-preview content-preview})
+              (notify-user {:msg (str "File " (pr-str file) " was parsed but produced no pages or blocks. "
+                                      "This may indicate a parsing issue. See console for details.")
+                            :level :warning})
+              (when import-state
+                (swap! (:ignored-files import-state) conj
+                       {:path file :reason :empty-parse-result :content-length (count content)}))))
         tx-options (merge (build-tx-options options)
                           {:journal-created-ats (build-journal-created-ats pages)})
         old-properties (keys @(get-in options [:import-state :property-schemas]))
@@ -1917,9 +1930,15 @@
         ;; returning val results in smoother ui updates
         m)
       (p/catch (fn [error]
+                 (log-fn :import-file-failed {:file path :error (.-message error)})
+                 (when import-state
+                   (swap! (:ignored-files import-state) conj
+                          {:path path :reason :import-error :error (.-message error)}))
                  (notify-user {:msg (str "Import failed on " (pr-str path) " with error:\n" (.-message error))
-                               :level :error
-                               :ex-data {:path path :error error}})))))
+                               :level :warning
+                               :ex-data {:path path :error error}})
+                 ;; Return nil to allow import to continue with remaining files
+                 nil))))
 
 (defn export-doc-files
   "Exports all user created files i.e. under journals/ and pages/.
