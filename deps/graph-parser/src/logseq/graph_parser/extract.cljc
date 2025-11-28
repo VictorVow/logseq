@@ -270,7 +270,7 @@
       (log/error :extract-pages-and-blocks-error {:exception e :file file})
       ;; Re-throw with context so the error is visible and can be handled upstream
       (throw (ex-info (str "Failed to extract pages and blocks from file: " file)
-                      {:file file :original-error e}
+                      {:file file}
                       e)))))
 
 (defn extract
