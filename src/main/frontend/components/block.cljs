@@ -1399,8 +1399,11 @@
             (->elem
              :a.external-link
              (cond->
-              {:target "_blank"
-               :href href}
+              (if (:breadcrumb? config)
+                ;; Inside a breadcrumb: keep link appearance but suppress URL navigation
+                {:on-click util/stop}
+                {:target "_blank"
+                 :href href})
                title
                (assoc :title title))
              (map-inline config label))))))))
