@@ -192,13 +192,11 @@
         (add-button block config)
 
         :else
-        (let [document-mode? (state/sub :document/mode?)
-              hiccup-config (merge
+        (let [hiccup-config (merge
                              {:id (str (:block/uuid block))
                               :db/id (:db/id block)
                               :block? block?
-                              :editor-box editor/box
-                              :document/mode? document-mode?}
+                              :editor-box editor/box}
                              config)
               config (common-handler/config-with-document-mode hiccup-config)
               blocks (if block? [block] (db/sort-by-order children block))]
