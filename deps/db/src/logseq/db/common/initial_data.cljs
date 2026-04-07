@@ -241,7 +241,8 @@
                                                       (and children? (empty? properties))
                                                       :children
                                                       :else
-                                                      :self)))]
+                                                      :self)
+                            :block.temp/has-children? (some? (:block/_parent block))))]
         (cond->
          {:block block'}
           children?
