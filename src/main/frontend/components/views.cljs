@@ -2021,7 +2021,7 @@
       (ui/foldable title body-fn {:title-trigger? false}))))
 
 (rum/defc ^:large-vars/cleanup-todo view-inner < rum/static
-  [view-entity {:keys [view-parent data full-data set-data! columns add-new-object! foldable-options input set-input! sorting set-sorting! filters set-filters! display-type group-by-property-ident config] :as option*}
+  [view-entity {:keys [view-parent data full-data set-data! columns add-new-object! foldable-options input set-input! sorting set-sorting! filters set-filters! display-type group-by-property-ident config loading?] :as option*}
    *scroller-ref]
   (let [journals? (:journals? config)
         option (assoc option* :properties
@@ -2103,10 +2103,13 @@
      (ui/foldable
       (view-head view-parent view-entity table columns input sorting set-input! add-new-object! option)
       (fn []
-        [:div.ls-view-body.flex.flex-col.gap-2.grid.mt-1
-         (filters-row view-entity table option)
+        (if loading?
+          [:div.flex.flex-col.space-2.gap-2.my-2
+           (repeat 3 (shui/skeleton {:class "h-6 w-full"}))]
+          [:div.ls-view-body.flex.flex-col.gap-2.grid.mt-1
+           (filters-row view-entity table option)
 
-         (let [view-opts {:*scroller-ref *scroller-ref
+           (let [view-opts {:*scroller-ref *scroller-ref
                           :display-type display-type
                           :row-selection row-selection
                           :add-new-object! add-new-object!}]
@@ -2150,7 +2153,7 @@
                       (assoc option
                              :group-by-property-ident group-by-property-ident
                              :disable-virtualized? disable-virtualized?)
-                      view-opts)))])
+                      view-opts)))]))
       (merge {:title-trigger? false} foldable-options))]))
 
 (rum/defcs view-container
@@ -2227,7 +2230,9 @@
 
 (rum/defc view-aux
   [view-entity {:keys [config view-parent view-feature-type data query-entity-ids query set-view-entity!] :as option}]
-  (let [[input set-input!] (hooks/use-state "")
+  (let [foldable-options (:foldable-options option)
+        collapsed-by-default? (true? (:default-collapsed? foldable-options))
+        [input set-input!] (hooks/use-state "")
         [properties set-properties!] (hooks/use-state nil)
         group-by-property (:logseq.property.view/group-by-property view-entity)
         display-type (or (:db/ident (get view-entity :logseq.property.view/type))
@@ -2247,7 +2252,8 @@
         [filters set-filters!] (rum/use-state (or view-filters {}))
         query? (= view-feature-type :query-result)
         option (if query? (assoc option :columns (get-query-columns config view-entity properties)) option)
-        [loading? set-loading!] (hooks/use-state (not query?))
+        [load-started? set-load-started!] (hooks/use-state (not collapsed-by-default?))
+        [loading? set-loading!] (hooks/use-state (and (not query?) (not collapsed-by-default?)))
         [data set-data!] (hooks/use-state data)
         [ref-pages-count set-ref-pages-count!] (hooks/use-state nil)
         [ref-matched-children-ids set-ref-matched-children-ids!] (hooks/use-state nil)
@@ -2263,8 +2269,9 @@
     (let [sorting-filters {:sorting sorting
                            :filters filters}]
       (hooks/use-effect!
-       load-view-data
-       [(:db/id view-entity)
+       (fn [] (when load-started? (load-view-data)))
+       [load-started?
+        (:db/id view-entity)
         (hooks/use-debounced-value input 300)
         sorting-filters
         group-by-property-ident
@@ -2275,41 +2282,50 @@
         (:filters view-parent)
         query-entity-ids
         (:data-changes-version option)]))
-    (if loading?
+    (if (and loading? (not collapsed-by-default?))
+      ;; Non-lazy: top-level skeleton while initial data loads (existing behavior)
       [:div.flex.flex-col.space-2.gap-2.my-2
        (repeat 3 (shui/skeleton {:class "h-6 w-full"}))]
-      [:div.flex.flex-col.gap-2
-       (view-container view-entity (assoc option
-                                          :data data
-                                          :full-data data
-                                          :filters filters
-                                          :sorting sorting
-                                          :set-filters! set-filters!
-                                          :set-sorting! set-sorting!
-                                          :set-data! set-data!
-                                          :set-input! set-input!
-                                          :input input
-                                          :items-count (if (every? number? data)
-                                                         (count data)
-                                                         ;; grouped
-                                                         (let [f (fn count-col
-                                                                   [data]
-                                                                   (reduce (fn [total item]
-                                                                             (if (number? item)
-                                                                               (+ total 1)
-                                                                               (let [[_k col] item]
-                                                                                 (if (and (vector? (first col))
-                                                                                          (not (map? col))
-                                                                                          (uuid? (ffirst col)))
-                                                                                   (+ total (count-col col))
-                                                                                   (+ total (count col)))))) 0 data))]
-                                                           (f data)))
-                                          :group-by-property-ident group-by-property-ident
-                                          :ref-pages-count ref-pages-count
-                                          :ref-matched-children-ids ref-matched-children-ids
-                                          :display-type display-type
-                                          :load-view-data load-view-data
-                                          :set-view-entity! set-view-entity!))])))
+      ;; Lazy (collapsed by default) or already loaded: render structure immediately
+      (let [on-expand! (fn [next-collapsed?]
+                         (when (and (not next-collapsed?) (not load-started?))
+                           (set-loading! true)
+                           (set-load-started! true)))
+            option' (-> option
+                        (assoc :loading? loading?)
+                        (update :foldable-options assoc :on-pointer-down on-expand!))]
+        [:div.flex.flex-col.gap-2
+         (view-container view-entity (assoc option'
+                                            :data data
+                                            :full-data data
+                                            :filters filters
+                                            :sorting sorting
+                                            :set-filters! set-filters!
+                                            :set-sorting! set-sorting!
+                                            :set-data! set-data!
+                                            :set-input! set-input!
+                                            :input input
+                                            :items-count (if (every? number? data)
+                                                           (count data)
+                                                           ;; grouped
+                                                           (let [f (fn count-col
+                                                                     [data]
+                                                                     (reduce (fn [total item]
+                                                                               (if (number? item)
+                                                                                 (+ total 1)
+                                                                                 (let [[_k col] item]
+                                                                                   (if (and (vector? (first col))
+                                                                                            (not (map? col))
+                                                                                            (uuid? (ffirst col)))
+                                                                                     (+ total (count-col col))
+                                                                                     (+ total (count col)))))) 0 data))]
+                                                             (f data)))
+                                            :group-by-property-ident group-by-property-ident
+                                            :ref-pages-count ref-pages-count
+                                            :ref-matched-children-ids ref-matched-children-ids
+                                            :display-type display-type
+                                            :load-view-data load-view-data
+                                            :set-view-entity! set-view-entity!))]))))
 
 (defn sub-view-data-changes
   [view-parent view-feature-type]
