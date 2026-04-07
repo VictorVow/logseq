@@ -37,16 +37,19 @@
                                                "text-error"
                                                :else
                                                "text-warning")})))]
-    (views/view
-     {:view-parent-uuid (:block/uuid page-entity)
-      :view-feature-type :linked-references
-      :show-items-count? true
-      :additional-actions [reference-filter]
-      :columns (views/build-columns config [] {:add-page-column? true})
-      :config config
-      :foldable-options (when (and (:linked-refs-section? config)
-                                   (zero? open-blocks-level))
-                          {:default-collapsed? true})})))
+    (let [collapsed-by-default? (and (:linked-refs-section? config)
+                                     (zero? open-blocks-level))]
+      (views/view
+       {:view-parent-uuid (:block/uuid page-entity)
+        :view-feature-type :linked-references
+        :show-items-count? true
+        :additional-actions [reference-filter]
+        :columns (views/build-columns config [] {:add-page-column? true})
+        :config config
+        ;; Don't load references until the collapsed section is expanded
+        :defer-resource? collapsed-by-default?
+        :foldable-options (when collapsed-by-default?
+                            {:default-collapsed? true})}))))
 
 (hsx/defc references
   [page-uuid config]
