@@ -274,13 +274,6 @@
                "")]
         (page-search-aux id format embed? db-tag? q input pos)))))
 
-(defn- search-blocks!
-  [state result]
-  (let [[_edit-block _ _ q] (:rum/args state)]
-    (p/let [matched-blocks (when-not (string/blank? q)
-                             (editor-handler/<get-matched-blocks q))]
-      (reset! result matched-blocks))))
-
 (defn- block-on-chosen-handler
   [embed? input id q format selected-text]
   (if embed?
@@ -303,29 +296,28 @@
            (state/clear-edit!)))))
     (editor-handler/block-on-chosen-handler id q format selected-text)))
 
-;; TODO: use rum/use-effect instead
-(rum/defcs block-search-auto-complete < rum/reactive
-  {:init (fn [state]
-           (let [result (atom nil)]
-             (search-blocks! state result)
-             (assoc state ::result result)))
-   :did-update (fn [state]
-                 (search-blocks! state (::result state))
-                 state)}
-  [state _edit-block input id q format selected-text]
-  (let [result (->> (rum/react (get state ::result))
-                    (remove (fn [b] (nil? (:block/uuid b)))))
-        embed? (= @commands/*current-command "Block embed")
-        chosen-handler (block-on-chosen-handler embed? input id q format selected-text)
-        non-exist-block-handler (editor-handler/block-non-exist-handler input)]
-    (ui/auto-complete
-     result
-     {:on-chosen   chosen-handler
-      :on-enter    non-exist-block-handler
-      :empty-placeholder   [:div.text-gray-500.text-sm.px-4.py-2 (t :editor/block-search)]
-      :item-render (fn [block]
-                     (node-render block q {:db-tag? false}))
-      :class       "ac-block-search"})))
+(rum/defc block-search-auto-complete
+  [_edit-block input id q format selected-text]
+  (let [[result set-result!] (rum/use-state nil)
+        debounced-q (hooks/use-debounced-value q 150)]
+    (hooks/use-effect!
+     (fn []
+       (p/let [matched-blocks (when-not (string/blank? debounced-q)
+                                (editor-handler/<get-matched-blocks debounced-q))]
+         (set-result! (remove (fn [b] (nil? (:block/uuid b)))
+                               matched-blocks))))
+     [debounced-q])
+    (let [embed? (= @commands/*current-command "Block embed")
+          chosen-handler (block-on-chosen-handler embed? input id q format selected-text)
+          non-exist-block-handler (editor-handler/block-non-exist-handler input)]
+      (ui/auto-complete
+       (or result [])
+       {:on-chosen   chosen-handler
+        :on-enter    non-exist-block-handler
+        :empty-placeholder   [:div.text-gray-500.text-sm.px-4.py-2 (t :editor/block-search)]
+        :item-render (fn [block]
+                       (node-render block q {:db-tag? false}))
+        :class       "ac-block-search"}))))
 
 (rum/defcs block-search < rum/reactive
   {:will-unmount (fn [state]

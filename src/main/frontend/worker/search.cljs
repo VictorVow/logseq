@@ -23,10 +23,12 @@
 ;; TODO: use sqlite for fuzzy search
 ;; maybe https://github.com/nalgeon/sqlean/blob/main/docs/fuzzy.md?
 (defonce fuzzy-search-indices (atom {}))
+(defonce page-counts (atom {}))
 
 (defn clear-fuzzy-search-indice!
   [repo]
-  (swap! fuzzy-search-indices dissoc repo))
+  (swap! fuzzy-search-indices dissoc repo)
+  (swap! page-counts dissoc repo))
 
 (defn- add-blocks-fts-triggers!
   "Table bindings of blocks tables and the blocks FTS virtual tables"
@@ -483,11 +485,11 @@ DROP TRIGGER IF EXISTS blocks_au;
 ;; Combine and re-rank keyword results
 (defn combine-results
   [db keyword-results]
-  (let [all-ids (set (map :id keyword-results))
+  (let [id->result (reduce (fn [m r] (assoc m (:id r) r)) {} keyword-results)
         merged (keep (fn [id]
                        (let [block (when id (d/entity db [:block/uuid (uuid id)]))]
                          (when-not (ldb/hidden? block)
-                           (let [result (first (filter #(= (:id %) id) keyword-results))
+                           (let [result (get id->result id)
                                  keyword-score (if (ldb/page? block)
                                                  (+ (or (:keyword-score result) 0.0) 2)
                                                  (or (:keyword-score result) 0.0))
@@ -502,7 +504,7 @@ DROP TRIGGER IF EXISTS blocks_au;
                              (assoc result
                                     :combined-score combined-score
                                     :keyword-score keyword-score)))))
-                     all-ids)
+                     (keys id->result))
         sorted-result (sort-by :combined-score #(compare %2 %1) merged)]
     sorted-result))
 
@@ -559,6 +561,17 @@ DROP TRIGGER IF EXISTS blocks_au;
            :alias (some-> (first (:block/_alias block))
                           (select-keys [:block/uuid :block/title]))})))))
 
+(defn- large-graph?
+  "Return true if repo has more than 2500 pages. Uses page-counts cache to avoid
+   scanning :block/name datoms on every search query."
+  [repo conn]
+  (let [cached (get @page-counts repo)]
+    (if (some? cached)
+      (> cached 2500)
+      (let [n (count (d/datoms @conn :avet :block/name))]
+        (swap! page-counts assoc repo n)
+        (> n 2500)))))
+
 (defn search-blocks
   "Options:
    * :page - the page to specifically search on
@@ -567,7 +580,8 @@ DROP TRIGGER IF EXISTS blocks_au;
    * :enable-snippet? - Whether to replace title with snippet. Defaults to true
    * :dev? - Allow all nodes to be seen for development. Defaults to false
    * :code-only? - Whether to return only code blocks. Defaults to false
-   * :built-in?  - Whether to return public built-in nodes for db graphs. Defaults to false"
+   * :built-in?  - Whether to return public built-in nodes for db graphs. Defaults to false
+   * :skip-non-match? - Skip LIKE fallback query for short queries. Defaults to false"
   [repo conn search-db q {:keys [limit search-limit page enable-snippet? page-only? code-only?]
                           :as option
                           :or {enable-snippet? true}}]
@@ -575,9 +589,9 @@ DROP TRIGGER IF EXISTS blocks_au;
     (when-not (string/blank? q)
       (let [option (assoc option :enable-snippet? enable-snippet?)
             match-input (get-match-input q)
-            page-count (count (d/datoms @conn :avet :block/name))
-            large-graph? (> page-count 2500)
-            non-match-input (when (<= (count q) 2)
+            large-graph? (large-graph? repo conn)
+            non-match-input (when (and (not (:skip-non-match? option))
+                                       (<= (count q) 2))
                               (str "%" (string/replace q #"\s+" "%") "%"))
             limit (or limit 100)
             limit-p (or search-limit limit)
@@ -712,6 +726,7 @@ DROP TRIGGER IF EXISTS blocks_au;
     (let [fuzzy-blocks-to-add (filter page-or-object? blocks-to-add)
           fuzzy-blocks-to-remove (filter page-or-object? blocks-to-remove)]
       (when (or (seq fuzzy-blocks-to-add) (seq fuzzy-blocks-to-remove))
+        (swap! page-counts dissoc repo)
         (swap! fuzzy-search-indices update repo
                (fn [indice]
                  (when indice

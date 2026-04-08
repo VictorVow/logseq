@@ -1545,7 +1545,9 @@
   (p/let [block (state/get-edit-block)
           result (search/block-search (state/get-current-repo) q {:built-in? false
                                                                   :enable-snippet? false
-                                                                  :page-only? page-only?})
+                                                                  :page-only? page-only?
+                                                                  :limit 20
+                                                                  :skip-non-match? true})
           matched (remove (fn [b] (= (:block/uuid b) (:block/uuid block))) result)
           result' (-> (concat matched
                               (when nlp-pages?
