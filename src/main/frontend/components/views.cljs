@@ -1716,6 +1716,18 @@
                  (when (= :node (:logseq.property/type p))
                    (:id column)))))))
 
+(defn- ungroup-view-rows
+  "Returns a flat seq of row db-ids regardless of whether rows come in the
+   flat form (`[id id ...]`) or the grouped form produced when
+   :logseq.property.view/group-by-property is set
+   (`[[by-value [id id ...]] ...]`)."
+  [rows]
+  (if (and (seq rows)
+           (let [r (first rows)]
+             (and (sequential? r) (not (map? r)) (= 2 (count r)))))
+    (mapcat (comp ungroup-view-rows second) rows)
+    rows))
+
 (defn- <load-gallery-card-data!
   "Ensures the gallery's rows and any node-property values they reference
   are loaded into the local DB so gallery-image-candidate-properties and
@@ -1723,7 +1735,7 @@
   Returns a promise that resolves when loading is done (or nil-safe)."
   [table columns]
   (let [repo (state/get-current-repo)
-        rows (:rows table)
+        rows (ungroup-view-rows (:rows table))
         node-prop-idents (gallery-node-property-idents columns)]
     (p/let [_ (when (seq rows)
                 (db-async/<get-blocks repo (vec rows) {}))
@@ -1744,7 +1756,7 @@
    the current query's rows include at least one Asset block.
    Preserves column order."
   [table columns]
-  (let [rows (:rows table)
+  (let [rows (ungroup-view-rows (:rows table))
         node-prop-idents (gallery-node-property-idents columns)]
     (->> node-prop-idents
          (keep (fn [prop-ident]
