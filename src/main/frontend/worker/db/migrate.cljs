@@ -80,7 +80,9 @@
                           :logseq.property/deleted-by-ref
                           :logseq.property.recycle/original-parent
                           :logseq.property.recycle/original-page
-                          :logseq.property.recycle/original-order]}]])
+                          :logseq.property.recycle/original-order]}]
+   ["65.25" {:properties [:logseq.property.view/gallery-image-property
+                          :logseq.property.view/gallery-card-dimensions]}]])
 
 (let [[major minor] (last (sort (map (comp (juxt :major :minor) db-schema/parse-schema-version first)
                                      schema-version->updates)))]
