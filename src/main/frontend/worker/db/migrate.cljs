@@ -82,8 +82,8 @@
                           :logseq.property.recycle/original-page
                           :logseq.property.recycle/original-order]}]
    ["65.25" {:properties [:logseq.property.view/gallery-image-property
-                          :logseq.property.view/gallery-card-dimensions]}]
-   ["65.26" {:properties [:logseq.property.view/gallery-card-custom-width
+                          :logseq.property.view/gallery-card-dimensions
+                          :logseq.property.view/gallery-card-custom-width
                           :logseq.property.view/gallery-card-custom-height]}]])
 
 (let [[major minor] (last (sort (map (comp (juxt :major :minor) db-schema/parse-schema-version first)
