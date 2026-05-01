@@ -1,11 +1,32 @@
 (ns logseq.db-sync.storage
-  (:require [cljs-bean.core :as bean]
-            [datascript.core :as d]
-            [datascript.storage :refer [IStorage]]
-            [logseq.db-sync.common :as common]
-            [logseq.db.common.normalize :as db-normalize]
-            [logseq.db.common.sqlite :as common-sqlite]
-            [logseq.db.frontend.schema :as db-schema]))
+  (:require
+   [cljs-bean.core :as bean]
+   [clojure.string :as string]
+   [datascript.core :as d]
+   [datascript.storage :refer [IStorage]]
+   [logseq.db-sync.checksum :as sync-checksum]
+   [logseq.db-sync.common :as common]
+   [logseq.db.common.normalize :as db-normalize]
+   [logseq.db.common.sqlite :as common-sqlite]
+   [logseq.db.frontend.schema :as db-schema]))
+
+(def ^:private tx-log-outliner-op-migration-sql
+  "alter table tx_log add column outliner_op TEXT")
+
+(defn- duplicate-column-error?
+  [error column-name]
+  (let [message (-> (or (ex-message error) (some-> error .-message) (str error))
+                    string/lower-case)]
+    (and (string/includes? message "duplicate column")
+         (string/includes? message (string/lower-case column-name)))))
+
+(defn- ensure-tx-log-outliner-op-column!
+  [sql]
+  (try
+    (common/sql-exec sql tx-log-outliner-op-migration-sql)
+    (catch :default error
+      (when-not (duplicate-column-error? error "outliner_op")
+        (throw error)))))
 
 ;; TODO: GC kvs table
 
@@ -17,6 +38,7 @@
                         "tx TEXT not null,"
                         "created_at INTEGER"
                         ");"))
+  (ensure-tx-log-outliner-op-column! sql)
   (common/sql-exec sql
                    (str "create table if not exists sync_meta ("
                         "key TEXT primary key,"
@@ -37,6 +59,12 @@
                    (name k)
                    (str v)))
 
+(defn get-checksum [sql]
+  (get-meta sql :checksum))
+
+(defn set-checksum! [sql checksum]
+  (set-meta! sql :checksum checksum))
+
 (defn get-t [sql]
   (let [value (get-meta sql :t)]
     (if (string? value)
@@ -51,22 +79,34 @@
     (set-t! sql t)
     t))
 
-(defn append-tx! [sql t tx-str created-at]
+(defn- outliner-op->sql [outliner-op]
+  (cond
+    (keyword? outliner-op) (name outliner-op)
+    (string? outliner-op) outliner-op
+    :else nil))
+
+(defn- sql->outliner-op [value]
+  (when (string? value)
+    (keyword value)))
+
+(defn append-tx! [sql t tx-str created-at outliner-op]
   (common/sql-exec sql
-                   (str "insert into tx_log (t, tx, created_at) values (?, ?, ?)"
-                        " on conflict(t) do update set tx = excluded.tx, created_at = excluded.created_at")
+                   (str "insert into tx_log (t, tx, created_at, outliner_op) values (?, ?, ?, ?)"
+                        " on conflict(t) do update set tx = excluded.tx, created_at = excluded.created_at, outliner_op = excluded.outliner_op")
                    t
                    tx-str
-                   created-at))
+                   created-at
+                   (outliner-op->sql outliner-op)))
 
 (defn fetch-tx-since [sql since-t]
   (let [rows (common/get-sql-rows
               (common/sql-exec sql
-                               "select t, tx from tx_log where t > ? order by t asc"
+                               "select t, tx, outliner_op from tx_log where t > ? order by t asc"
                                since-t))]
     (mapv (fn [row]
             {:t (aget row "t")
-             :tx (aget row "tx")})
+             :tx (aget row "tx")
+             :outliner-op (sql->outliner-op (aget row "outliner_op"))})
           rows)))
 
 (defn- upsert-addr-content! [sql data]
@@ -105,15 +145,41 @@
       (restore-data-from-addr sql addr))))
 
 (defn- append-tx-for-tx-report
-  [sql {:keys [db-after db-before tx-data]}]
-  (let [new-t (next-t! sql)
-        created-at (common/now-ms)
-        normalized-data (->> tx-data
-                             (db-normalize/normalize-tx-data db-after db-before))
-        ;; _ (prn :debug :tx-data tx-data)
-        ;; _ (prn :debug :normalized-data normalized-data)
-        tx-str (common/write-transit normalized-data)]
-    (append-tx! sql new-t tx-str created-at)))
+  [sql {:keys [db-after db-before tx-data tx-meta] :as tx-report}]
+  (let [prev-checksum (get-checksum sql)
+        checksum (sync-checksum/update-checksum prev-checksum tx-report)]
+    ;; (let [full-checksum (sync-checksum/recompute-checksum db-after)
+    ;;       prev-full-checksum (sync-checksum/recompute-checksum db-before)]
+    ;;   (when (and prev-checksum
+    ;;              (not= checksum full-checksum))
+    ;;     (prn :debug :before-checksum-error {:prev-tx (get-t sql)
+    ;;                                         :prev-checksum prev-checksum
+    ;;                                         :prev-full-checksum prev-full-checksum
+    ;;                                         :new-checksum checksum
+    ;;                                         :recomputed-after-checksum full-checksum
+    ;;                                         :tx-meta tx-meta
+    ;;                                         :db-before (ldb/write-transit-str db-before)
+    ;;                                         :tx-data (ldb/write-transit-str tx-data)})
+    ;;     (when (not= prev-checksum prev-full-checksum)
+    ;;       (prn :debug :prev-checksum-not-match {:prev-checksum prev-checksum
+    ;;                                             :prev-full-checksum prev-full-checksum}))
+    ;;     (throw (ex-info "server checksum doesn't match"
+    ;;                     {:prev-checksum prev-checksum
+    ;;                      :recomputed-after-checksum full-checksum
+    ;;                      :tx-meta tx-meta
+    ;;                      :tx-data tx-data
+    ;;                      :prev-tx (get-t sql)}))))
+
+    (set-checksum! sql checksum)
+    (when-not (empty? tx-data)
+      (let [created-at (common/now-ms)
+            normalized-data (->> tx-data
+                                 (db-normalize/normalize-tx-data db-after db-before))
+            ;; _ (prn :debug :tx-data tx-data)
+            ;; _ (prn :debug :normalized-data normalized-data)
+            tx-str (common/write-transit normalized-data)
+            new-t (next-t! sql)]
+        (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta))))))
 
 (defn- listen-db-updates!
   [sql conn]
@@ -121,7 +187,8 @@
              (fn [tx-report]
                (append-tx-for-tx-report sql tx-report))))
 
-(defn open-conn [sql]
+(defn open-conn
+  [sql]
   (init-schema! sql)
   (let [storage (new-sqlite-storage sql)
         schema db-schema/schema

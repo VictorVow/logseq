@@ -1,9 +1,9 @@
 (ns frontend.handler.repo
   "System-component-like ns that manages user's repos/graphs"
-  (:refer-clojure :exclude [clone])
   (:require [clojure.string :as string]
             [electron.ipc :as ipc]
             [frontend.config :as config]
+            [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db :as db]
             [frontend.db.persist :as db-persist]
@@ -17,7 +17,6 @@
             [frontend.persist-db :as persist-db]
             [frontend.search :as search]
             [frontend.state :as state]
-            [frontend.undo-redo :as undo-redo]
             [frontend.util :as util]
             [frontend.util.text :as text-util]
             [logseq.db.frontend.schema :as db-schema]
@@ -41,21 +40,17 @@
          (do
            (state/set-current-repo! nil)
            (when-let [graph (:url (first (state/get-repos)))]
-             (notification/show! (str "Removed graph "
-                                      (pr-str (text-util/get-graph-name-from-path url))
-                                      ". Redirecting to graph "
-                                      (pr-str (text-util/get-graph-name-from-path graph)))
+             (notification/show! (t :graph/removed-and-redirecting
+                                    (text-util/get-graph-name-from-path url)
+                                    (text-util/get-graph-name-from-path graph))
                                  :success)
              (state/pub-event! [:graph/switch graph {:persist? false}])))
-         (notification/show! (str "Removed graph " (pr-str (text-util/get-graph-name-from-path url))) :success))))))
+           (notification/show! (t :graph/removed (text-util/get-graph-name-from-path url)) :success))))))
 
 (defn start-repo-db-if-not-exists!
   [repo & {:as opts}]
   (state/set-current-repo! repo)
-  (db/start-db-conn! repo (assoc opts
-                                 :db-graph? true
-                                 :listen-handler (fn [conn]
-                                                   (undo-redo/listen-db-changes! repo conn)))))
+  (db/start-db-conn! repo (assoc opts :db-graph? true)))
 
 (defn restore-and-setup-repo!
   "Restore the db of a graph from the persisted data, and setup. Create a new
@@ -159,7 +154,7 @@
      (prn "New db created: " full-graph-name)
      full-graph-name)
    (p/catch (fn [error]
-              (notification/show! "Create graph failed." :error)
+              (notification/show! (t :graph/create-error) :error)
               (js/console.error error)))))
 
 (defn new-db!
@@ -169,7 +164,7 @@
    (let [full-graph-name (str config/db-version-prefix graph)]
      (if (graph-already-exists? graph)
        (state/pub-event! [:notification/show
-                          {:content (str "The graph '" graph "' already exists. Please try again with another name.")
+                          {:content (t :graph/already-exists-error graph)
                            :status :error}])
        (create-db full-graph-name opts)))))
 
@@ -178,5 +173,5 @@
   (p/do!
    (state/<invoke-db-worker :thread-api/gc-graph graph)
    (state/pub-event! [:notification/show
-                      {:content "Graph gc successfully!"
+                      {:content (t :graph/gc-success)
                        :status :success}])))

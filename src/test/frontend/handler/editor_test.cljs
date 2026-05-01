@@ -5,7 +5,8 @@
             [frontend.handler.editor :as editor]
             [frontend.state :as state]
             [frontend.test.helper :as test-helper]
-            [frontend.util.cursor :as cursor]))
+            [frontend.util.cursor :as cursor]
+            [logseq.outliner.core :as outliner-core]))
 
 (use-fixtures :each test-helper/start-and-destroy-db)
 
@@ -207,3 +208,63 @@
 
       (editor/save-block! repo block-uuid "# bar")
       (is (= "bar" (:block/title (model/query-block-by-uuid block-uuid)))))))
+
+(deftest block-default-collapsed-respects-ignore-block-collapsed-flag
+  (with-redefs [db/entity (constantly nil)]
+    (is (true? (editor/block-default-collapsed?
+                {:block/collapsed? true}
+                {})))
+    (is (not (editor/block-default-collapsed?
+              {:block/collapsed? true}
+              {:ignore-block-collapsed? true}))
+        "Flashcard review should be able to ignore persisted collapsed state")
+    (is (true? (editor/block-default-collapsed?
+                {:block/collapsed? false}
+                {:ignore-block-collapsed? true
+                 :default-collapsed? true}))
+        "Ignore flag should not disable other default-collapsed rules")))
+
+(deftest load-children-respects-ignore-block-collapsed-flag
+  (is (false? (#'editor/load-children?
+               {:block/collapsed? true}
+               nil
+               false))
+      "Collapsed blocks should not load children by default")
+  (is (true? (#'editor/load-children?
+              {:block/collapsed? true}
+              nil
+              true))
+      "Flashcard answer mode should force loading children for collapsed blocks")
+  (is (true? (#'editor/load-children?
+              {:block/collapsed? true}
+              false
+              false))
+      "Temporary expanded UI state should load children")
+  (is (false? (#'editor/load-children?
+               {:block/collapsed? false}
+               true
+               false))
+      "Temporary collapsed UI state should skip children loading"))
+
+(deftest paste-cut-recycled-block-moves-existing-node-out-of-recycle
+  (test-helper/load-test-files [{:page {:block/title "Page 1"}
+                                 :blocks [{:block/title "source"}]}
+                                {:page {:block/title "Page 2"}
+                                 :blocks [{:block/title "target"}]}])
+  (let [source (test-helper/find-block-by-content "source")
+        target (test-helper/find-block-by-content "target")
+        recycle-page (db/get-page "Recycle")]
+    (outliner-core/delete-blocks! (db/get-db test-helper/test-db false) [source] {})
+    (state/set-block-op-type! :cut)
+    (editor/paste-blocks [{:block/uuid (:block/uuid source)
+                           :block/title "source"}]
+                         {:target-block target
+                          :sibling? true
+                          :keep-uuid? true
+                          :ops-only? true})
+    (let [source' (db/entity [:block/uuid (:block/uuid source)])]
+      (is (= (:db/id (:block/page target)) (:db/id (:block/page source'))))
+      (is (= (:db/id (:block/parent target)) (:db/id (:block/parent source'))))
+      (is (nil? (:logseq.property/deleted-at source')))
+      (is (nil? (:logseq.property.recycle/original-page source')))
+      (is (not= (:db/id recycle-page) (:db/id (:block/page source')))))))

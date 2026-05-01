@@ -6,17 +6,18 @@
             [clojure.string :as string]
             [datascript.core :as d]
             [frontend.common.search-fuzzy :as fuzzy]
-            [frontend.worker.embedding :as embedding]
             [goog.object :as gobj]
             [logseq.common.config :as common-config]
             [logseq.common.util :as common-util]
             [logseq.common.util.namespace :as ns-util]
             [logseq.db :as ldb]
             [logseq.db.frontend.content :as db-content]
-            [logseq.graph-parser.text :as text]
-            [missionary.core :as m]))
+            [logseq.graph-parser.text :as text]))
 
-(def fuse (aget Fuse "default"))
+(def fuse
+  ;; Fuse 6 exposed the constructor on `default`, while Fuse 7's CJS path returns
+  ;; the constructor directly.
+  (or (aget Fuse "default") Fuse))
 
 ;; TODO: use sqlite for fuzzy search
 ;; maybe https://github.com/nalgeon/sqlean/blob/main/docs/fuzzy.md?
@@ -25,25 +26,6 @@
 (defn clear-fuzzy-search-indice!
   [repo]
   (swap! fuzzy-search-indices dissoc repo))
-
-;; Configuration for re-ranking
-(def config
-  {:keyword-weight 0.9
-   :semantic-weight 0.1})
-
-(defn- log-score
-  [score]
-  (if (> score 2)
-    (js/Math.log score)
-    score))
-
-;; Normalize scores to [0, 1] range using min-max normalization
-(defn normalize-score [score min-score max-score]
-  (if (= min-score max-score)
-    0.0
-    (let [normalized (/ (log-score (- score min-score))
-                        (log-score (- max-score min-score)))]
-      (max 0.0 (min 1.0 normalized)))))
 
 (defn- add-blocks-fts-triggers!
   "Table bindings of blocks tables and the blocks FTS virtual tables"
@@ -119,24 +101,48 @@ DROP TRIGGER IF EXISTS blocks_au;
   (str "(" (->> (map (fn [id] (str "'" id "'")) ids)
                 (string/join ", ")) ")"))
 
+(def ^:private upsert-blocks-batch-size 2000)
+
+(def ^:private upsert-blocks-sql
+  (memoize
+   (fn [row-count]
+     (str "INSERT INTO blocks (id, title, page) VALUES "
+          (string/join ", " (repeat row-count "(?, ?, ?)"))
+          " ON CONFLICT (id) DO UPDATE SET (title, page) = (excluded.title, excluded.page)"))))
+
+(defn- valid-upsert-block?
+  [item]
+  (and (common-util/uuid-string? (.-id item))
+       (common-util/uuid-string? (.-page item))))
+
+(defn- throw-upsert-blocks-error!
+  [item]
+  (js/console.error "Upsert blocks wrong data: ")
+  (js/console.dir item)
+  (throw (ex-info "Search upsert-blocks wrong data: "
+                  (bean/->clj item))))
+
+(defn- upsert-bind-params
+  [batch]
+  (into-array
+   (mapcat (fn [item]
+             [(.-id item) (.-title item) (.-page item)])
+           batch)))
+
 (defn upsert-blocks!
   [^Object db blocks]
+  (assert db ::upsert-blocks!)
   (.transaction db (fn [tx]
-                     (doseq [item blocks]
-                       (if (and (common-util/uuid-string? (.-id item))
-                                (common-util/uuid-string? (.-page item)))
-                         (.exec tx #js {:sql "INSERT INTO blocks (id, title, page) VALUES ($id, $title, $page) ON CONFLICT (id) DO UPDATE SET (title, page) = ($title, $page)"
-                                        :bind #js {:$id (.-id item)
-                                                   :$title (.-title item)
-                                                   :$page (.-page item)}})
-                         (do
-                           (js/console.error "Upsert blocks wrong data: ")
-                           (js/console.dir item)
-                           (throw (ex-info "Search upsert-blocks wrong data: "
-                                           (bean/->clj item)))))))))
+                     (doseq [batch (partition-all upsert-blocks-batch-size blocks)]
+                       (doseq [item batch]
+                         (when-not (valid-upsert-block? item)
+                           (throw-upsert-blocks-error! item)))
+                       (.exec tx #js {:sql (upsert-blocks-sql (count batch))
+                                      :bind (upsert-bind-params batch)})))))
 
 (defn delete-blocks!
   [db ids]
+  (assert db ::delete-blocks!)
   (let [sql (str "DELETE from blocks WHERE id IN " (clj-list->sql ids))]
     (.exec db sql)))
 
@@ -432,15 +438,14 @@ DROP TRIGGER IF EXISTS blocks_au;
 (defn- sanitize
   [content]
   (some-> content
-          (fuzzy/search-normalize true)))
+          (fuzzy/search-normalize true {:lower-case? false})))
 
 (defn- block-search-title
   "Build display title from block entity with original casing."
   [block]
   (cond->
-   (-> block
-       (update :block/title ldb/get-title-with-parents)
-       db-content/recur-replace-uuid-in-block-title)
+    (let [block' (update block :block/title ldb/get-title-with-parents)]
+      (db-content/recur-replace-uuid-in-block-title block'))
     (ldb/journal? block)
     (str " " (:block/journal-day block))))
 
@@ -497,41 +502,29 @@ DROP TRIGGER IF EXISTS blocks_au;
                (filter (fn [{:keys [title]}]
                          (exact-matched? q title)))))))))
 
-;; Combine and re-rank results
+;; Combine and re-rank keyword results
 (defn combine-results
-  [db keyword-results semantic-results]
-  (let [;; Extract score ranges for normalization
-        keyword-scores (map :keyword-score keyword-results)
-        k-min (if (seq keyword-scores) (apply min keyword-scores) 0.0)
-        k-max (if (seq keyword-scores) (apply max keyword-scores) 1.0)
-        all-ids (set/union (set (map :id keyword-results))
-                           (set (map :id semantic-results)))
-        merged (map (fn [id]
-                      (let [block (when id (d/entity db [:block/uuid (uuid id)]))
-                            k-result (first (filter #(= (:id %) id) keyword-results))
-                            s-result (first (filter #(= (:id %) id) semantic-results))
-                            result (merge s-result k-result)
-                            page? (ldb/page? block)
-                            keyword-score (if page? (+ (:keyword-score k-result) 2) (:keyword-score k-result))
-                            k-score (or keyword-score 0.0)
-                            s-score (or (:semantic-score s-result) 0.0)
-                            norm-k-score (normalize-score k-score k-min k-max)
-                            ;; Weighted combination
-                            combined-score (+ (* (:keyword-weight config)
-                                                 norm-k-score)
-                                              (* (:semantic-weight config) s-score)
-                                              (cond
-                                                (ldb/page? block)
-                                                0.02
-                                                (:block/tags block)
-                                                0.01
-                                                :else
-                                                0))]
-                        (merge result
-                               {:combined-score combined-score
-                                :keyword-score k-score
-                                :semantic-score s-score})))
-                    all-ids)
+  [db keyword-results]
+  (let [all-ids (set (map :id keyword-results))
+        merged (keep (fn [id]
+                       (let [block (when id (d/entity db [:block/uuid (uuid id)]))]
+                         (when-not (ldb/hidden? block)
+                           (let [result (first (filter #(= (:id %) id) keyword-results))
+                                 keyword-score (if (ldb/page? block)
+                                                 (+ (or (:keyword-score result) 0.0) 2)
+                                                 (or (:keyword-score result) 0.0))
+                                 combined-score (+ keyword-score
+                                                   (cond
+                                                     (ldb/page? block)
+                                                     0.02
+                                                     (:block/tags block)
+                                                     0.01
+                                                     :else
+                                                     0))]
+                             (assoc result
+                                    :combined-score combined-score
+                                    :keyword-score keyword-score)))))
+                     all-ids)
         sorted-result (sort-by :combined-score #(compare %2 %1) merged)]
     sorted-result))
 
@@ -571,7 +564,7 @@ DROP TRIGGER IF EXISTS blocks_au;
     (when-let [block (d/entity @conn [:block/uuid block-id])]
       (when (include-search-block? conn block code-class option)
         (let [display-title (if (:enable-snippet? option)
-                              (ensure-highlighted-snippet snippet (or (block-search-title block) title) q)
+                              (ensure-highlighted-snippet snippet title q)
                               (or snippet title))]
           {:db/id (:db/id block)
            :block/uuid (:block/uuid block)
@@ -600,59 +593,42 @@ DROP TRIGGER IF EXISTS blocks_au;
   [repo conn search-db q {:keys [limit search-limit page enable-snippet? page-only? code-only?]
                           :as option
                           :or {enable-snippet? true}}]
-  (m/sp
-    (when-not (string/blank? q)
-      (let [option (assoc option :enable-snippet? enable-snippet?)
-            match-input (get-match-input q)
-            page-count (count (d/datoms @conn :avet :block/name))
-            large-graph? (> page-count 2500)
-            non-match-input (when (<= (count q) 2)
-                              (str "%" (string/replace q #"\s+" "%") "%"))
-            limit (or limit 100)
-            limit-p (or search-limit limit)
-           ;; don't use sqlite snippet function anymore, all snippets will be handled by ensure-highlighted-snippet
-            select "select id, page, title, rank from blocks_fts where "
-            pg-sql (if page "page = ? and" "")
-            match-sql (if (ns-util/namespace-page? q)
-                        (str select pg-sql " title match ? or title match ? order by rank limit ?")
-                        (str select pg-sql " title match ? order by rank limit ?"))
-            non-match-sql (str select pg-sql " title like ? limit ?")
-            matched-result (when-not page-only?
-                             (search-blocks-aux search-db match-sql q match-input page limit-p (ns-util/namespace-page? q)))
-            non-match-result (when (and (not page-only?) non-match-input)
-                               (->> (search-blocks-aux search-db non-match-sql q non-match-input page limit-p)
-                                    (map (fn [result]
-                                           (assoc result :keyword-score (fuzzy/score q (:title result)))))))
-            ;; fuzzy is too slow for large graphs
-            fuzzy-result (when-not (or page large-graph?)
-                           (->> (fuzzy-search repo @conn q option)
-                                (map (fn [result]
-                                       (assoc result :keyword-score (fuzzy/score q (:title result)))))))
-            semantic-search-result* (m/? (embedding/task--search repo q 10))
-            semantic-search-result (->> semantic-search-result*
-                                        (map (fn [{:keys [block distance]}]
-                                               (let [page-id (when-let [id (:block/uuid (:block/page block))] (str id))]
-                                                 (cond->
-                                                  {:id (str (:block/uuid block))
-                                                   :title (:block/title block)
-                                                   :semantic-score (/ 1.0 (+ 1.0 distance))}
-                                                   page-id
-                                                   (assoc :page page-id))))))
+  (when-not (string/blank? q)
+    (let [option (assoc option :enable-snippet? enable-snippet?)
+          match-input (get-match-input q)
+          non-match-input (when (<= (count q) 2)
+                            (str "%" (string/replace q #"\s+" "%") "%"))
+          limit (or limit 100)
+          limit-p (or search-limit limit)
+          ;; don't use sqlite snippet function anymore, all snippets will be handled by ensure-highlighted-snippet
+          select "select id, page, title, rank from blocks_fts where "
+          pg-sql (if page "page = ? and" "")
+          match-sql (if (ns-util/namespace-page? q)
+                      (str select pg-sql " title match ? or title match ? order by rank limit ?")
+                      (str select pg-sql " title match ? order by rank limit ?"))
+          non-match-sql (str select pg-sql " title like ? limit ?")
+          matched-result (when-not page-only?
+                           (search-blocks-aux search-db match-sql q match-input page limit-p (ns-util/namespace-page? q)))
+          non-match-result (when (and (not page-only?) non-match-input)
+                             (->> (search-blocks-aux search-db non-match-sql q non-match-input page limit-p)
+                                  (map (fn [result]
+                                         (assoc result :keyword-score (fuzzy/score q (:title result)))))))
+          fuzzy-result (->> (fuzzy-search repo @conn q option)
+                            (map (fn [result]
+                                   (assoc result :keyword-score (fuzzy/score q (:title result))))))
           ;;  _ (prn :debug "Search results before combine:" enable-snippet? (map :snippet matched-result))
           ;;  _ (doseq [item (concat fuzzy-result matched-result)]
           ;;      (prn :debug :keyword-search-result item))
-          ;;  _ (doseq [item semantic-search-result]
-          ;;      (prn :debug :semantic-search-item item))
-            combined-result (combine-results @conn (concat fuzzy-result matched-result non-match-result) semantic-search-result)
-            code-class (when code-only?
-                         (d/entity @conn :logseq.class/Code-block))
-            result (->> combined-result
-                        (common-util/distinct-by :id)
-                        (keep #(search-result->block-result conn q code-class option %)))
-            result (cond->> result
-                     search-limit
-                     (take limit))]
-        (common-util/distinct-by :block/uuid result)))))
+          combined-result (combine-results @conn (concat fuzzy-result matched-result non-match-result))
+          code-class (when code-only?
+                       (d/entity @conn :logseq.class/Code-block))
+          result (->> combined-result
+                      (common-util/distinct-by :id)
+                      (keep #(search-result->block-result conn q code-class option %)))
+          result (cond->> result
+                   search-limit
+                   (take limit))]
+      (common-util/distinct-by :block/uuid result))))
 
 (defn truncate-table!
   [db]
@@ -676,25 +652,64 @@ DROP TRIGGER IF EXISTS blocks_au;
 
 (defn- get-blocks-from-datoms-impl
   [{:keys [db-after db-before]} datoms]
-  (when (seq datoms)
-    (let [blocks-to-add-set (->> (filter :added datoms)
+  (letfn [(page-descendants [page]
+            (loop [pages [page]
+                   result []]
+              (if-let [page' (first pages)]
+                (let [children (->> (:block/_parent page')
+                                    (filter ldb/page?)
+                                    ldb/sort-by-order)]
+                  (recur (concat (rest pages) children)
+                         (conj result page')))
+                result)))
+          (page-tree [db page]
+            (->> (page-descendants page)
+                 (mapcat (fn [page']
+                           (concat
+                            [page']
+                            (mapcat #(ldb/get-block-and-children db (:block/uuid %))
+                                    (ldb/sort-by-order (:block/_page page'))))))
+                 distinct))
+          (entity-tree [db entity]
+            (cond
+              (nil? entity) []
+              (ldb/page? entity) (page-tree db entity)
+              (:block/uuid entity) (ldb/get-block-and-children db (:block/uuid entity))
+              :else [entity]))
+          (referrer-eids [db eids]
+            (->> eids
+                 (mapcat (fn [id]
+                           (map :db/id (:block/_refs (d/entity db id)))))
+                 set))
+          (entities-for [db eids {:keys [include-tree? include-refs?]}]
+            (let [entities (keep #(d/entity db %) eids)
+                  entities' (if include-tree?
+                              (mapcat #(entity-tree db %) entities)
+                              entities)
+                  entities'' (if include-refs?
+                               (concat entities'
+                                       (keep #(d/entity db %)
+                                             (referrer-eids db eids)))
+                               entities')]
+              (->> entities''
+                   distinct
+                   (remove nil?))))]
+    (when (seq datoms)
+      (let [ref-affecting-attrs #{:block/uuid :block/name :block/title :block/properties}
+            visibility-affecting-attrs #{:logseq.property/deleted-at :block/parent :block/page}
+            ref-eids (->> datoms
+                          (filter #(contains? ref-affecting-attrs (:a %)))
+                          (map :e)
+                          set)
+            visibility-eids (->> datoms
+                                 (filter #(contains? visibility-affecting-attrs (:a %)))
                                  (map :e)
-                                 (set))
-          blocks-to-remove-set (->> (remove :added datoms)
-                                    (filter #(= :block/uuid (:a %)))
-                                    (map :e)
-                                    (set))
-          blocks-to-add-set' (if (seq blocks-to-add-set)
-                               (->> blocks-to-add-set
-                                    (mapcat (fn [id] (map :db/id (:block/_refs (d/entity db-after id)))))
-                                    (concat blocks-to-add-set)
-                                    set)
-                               blocks-to-add-set)]
-      {:blocks-to-remove     (->>
-                              (keep #(d/entity db-before %) blocks-to-remove-set))
-       :blocks-to-add        (->>
-                              (keep #(d/entity db-after %) blocks-to-add-set')
-                              (remove hidden-entity?))})))
+                                 set)]
+        {:blocks-to-remove (concat (entities-for db-before ref-eids {:include-refs? true})
+                                   (entities-for db-before visibility-eids {:include-tree? true}))
+         :blocks-to-add (->> (concat (entities-for db-after ref-eids {:include-refs? true})
+                                     (entities-for db-after visibility-eids {:include-tree? true}))
+                             (remove hidden-entity?))}))))
 
 (defn- get-affected-blocks
   [tx-report]

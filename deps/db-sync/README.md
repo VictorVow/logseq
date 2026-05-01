@@ -13,7 +13,7 @@ It includes the Cloudflare Worker implementation and a Node.js adapter for self-
 
 ```bash
 cd deps/db-sync
-yarn watch
+pnpm watch
 
 # open another terminal
 cd deps/db-sync/worker
@@ -33,13 +33,68 @@ wrangler d1 migrations apply logseq-sync-graphs-prod --env prod
 
 For local development, run `wrangler d1 migrations apply DB --local`.
 
+### Production Graph Lookup
+
+Show the graphs available to a production user by `username` or `user id`:
+
+```bash
+cd deps/db-sync
+pnpm show-graphs-for-user --username alice
+pnpm show-graphs-for-user --user-id us-east-1:example-user-id
+```
+
+The script uses `worker/wrangler.toml`, runs against the remote D1 binding `DB`,
+defaults to `--env prod`, and prints JSON when `--json` is added.
+
+Download a graph snapshot into a local sqlite debug file matching local graph DB schema (`kvs` table only):
+
+```bash
+cd deps/db-sync
+pnpm run download-graph-db -- --graph-id 6f2d7f6f-xxxx-xxxx-xxxx-xxxxxxxxxxxx --admin-token <admin-token>
+```
+
+You can also pass `--admin-token <token>` or set `DB_SYNC_ADMIN_TOKEN`. The output defaults to
+`tmp/graph-<graph-id>.snapshot.sqlite` and can be changed with `--output`.
+
+Show stored and recomputed checksum for a local sqlite graph db:
+
+```bash
+cd deps/db-sync
+pnpm run show-sqlite-checksum -- --db ~/Downloads/test.sqlite
+```
+
+Delete the graphs owned by a production user after an explicit confirmation:
+
+```bash
+cd deps/db-sync
+pnpm delete-graphs-for-user --username alice
+pnpm delete-graphs-for-user --user-id us-east-1:example-user-id
+```
+
+The delete script shows the owned graphs first and requires typing `DELETE`
+before it calls the worker delete endpoint for each graph. Set
+`DB_SYNC_BASE_URL` and `DB_SYNC_ADMIN_TOKEN` or pass `--base-url` and
+`--admin-token` when running it.
+
+Delete a user completely (owned graphs, memberships, keys, and user row):
+
+```bash
+cd deps/db-sync
+pnpm run delete-user-totally -- --username alice
+pnpm run delete-user-totally -- --user-id us-east-1:example-user-id
+```
+
+The script prints all linked graphs first, deletes owned graphs through the
+admin graph delete endpoint, then removes the user's remaining D1 references.
+It requires typing `DELETE` as confirmation.
+
 ### Node.js Adapter (self-hosted)
 
 Build the adapter:
 
 ```bash
 cd deps/db-sync
-npm run build:node-adapter
+pnpm build:node-adapter
 ```
 
 Run the adapter with Cognito auth:
@@ -58,7 +113,7 @@ Run db-sync tests (includes Node adapter tests):
 
 ```bash
 cd deps/db-sync
-npm run test:node-adapter
+pnpm test:node-adapter
 ```
 
 ## Environment Variables
@@ -67,6 +122,7 @@ npm run test:node-adapter
 | --- | --- |
 | DB_SYNC_PORT | HTTP server port |
 | DB_SYNC_BASE_URL | External base URL for asset links |
+| DB_SYNC_ADMIN_TOKEN | Admin-only token for operator graph deletion endpoints |
 | DB_SYNC_DATA_DIR | Data directory for sqlite + assets |
 | DB_SYNC_STORAGE_DRIVER | Storage backend selection (sqlite) |
 | DB_SYNC_ASSETS_DRIVER | Assets backend selection (filesystem) |

@@ -182,6 +182,13 @@
                   ldb/class-instance? (fn [_ _] true)]
       (is (false? (#'search/code-block? :code-class {:logseq.property.node/display-type :code}))))))
 
+(deftest hidden-entity-includes-recycled-entities
+  (testing "recycled roots are hidden"
+    (is (true? (#'search/hidden-entity? {:logseq.property/deleted-at 1}))))
+
+  (testing "entities on recycled pages are hidden"
+    (is (true? (#'search/hidden-entity? {:block/page {:logseq.property/deleted-at 1}})))))
+
 (deftest search-blocks-aux-bind-count
   (testing "namespace match SQL keeps bind count aligned"
     (let [sql "select id, page, title, rank from blocks_fts where title match ? or title match ? order by rank limit ?"
@@ -200,3 +207,55 @@
           result (#'search/search-blocks-aux (checking-db) sql "a/" "%a/%" "page-1" 10)]
       (is (some? result))
       (is (empty? result)))))
+
+(deftest fuse-constructor-interop
+  (testing "Fuse constructor remains usable for build/search/add/remove across export shapes"
+    (let [ctor search/fuse
+          indice (ctor. (clj->js [{:id "1" :title "alpha beta"}])
+                        (clj->js {:keys ["title"]
+                                  :shouldSort true
+                                  :tokenize true
+                                  :distance 1024
+                                  :threshold 0.5
+                                  :minMatchCharLength 1}))]
+      (.add indice (clj->js {:id "2" :title "gamma"}))
+      (.remove indice (fn [page] (= "2" (aget page "id"))))
+      (let [result (js->clj (.search indice "alpha" (clj->js {:limit 5})) :keywordize-keys true)]
+        (is (some? ctor))
+        (is (= 1 (count result)))
+        (is (= "alpha beta" (get-in result [0 :item :title])))))))
+
+(deftest upsert-blocks-batches-rows-into-single-sql-statement
+  (let [calls (atom [])
+        tx #js {:exec (fn [opts]
+                        (swap! calls conj {:sql (aget opts "sql")
+                                           :bind (js->clj (aget opts "bind"))}))}
+        db #js {:transaction (fn [f] (f tx))}
+        blocks (clj->js [{:id "67e55044-10b1-426f-9247-bb680e5fe0c8"
+                          :title "alpha"
+                          :page "67e55044-10b1-426f-9247-bb680e5fe0c8"}
+                         {:id "8f14e45f-ea6e-4be8-b53f-bf0f2ca8a5db"
+                          :title "beta"
+                          :page "8f14e45f-ea6e-4be8-b53f-bf0f2ca8a5db"}
+                         {:id "9d5ed678-fe57-4bcf-bf4d-6f2fd5f8995d"
+                          :title "gamma"
+                          :page "9d5ed678-fe57-4bcf-bf4d-6f2fd5f8995d"}])]
+    (search/upsert-blocks! db blocks)
+    (is (= 1 (count @calls)))
+    (is (= "INSERT INTO blocks (id, title, page) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?) ON CONFLICT (id) DO UPDATE SET (title, page) = (excluded.title, excluded.page)"
+           (:sql (first @calls))))
+    (is (= ["67e55044-10b1-426f-9247-bb680e5fe0c8" "alpha" "67e55044-10b1-426f-9247-bb680e5fe0c8"
+            "8f14e45f-ea6e-4be8-b53f-bf0f2ca8a5db" "beta" "8f14e45f-ea6e-4be8-b53f-bf0f2ca8a5db"
+            "9d5ed678-fe57-4bcf-bf4d-6f2fd5f8995d" "gamma" "9d5ed678-fe57-4bcf-bf4d-6f2fd5f8995d"]
+           (:bind (first @calls))))))
+
+(deftest upsert-blocks-throws-on-invalid-input
+  (let [tx #js {:exec (fn [_opts] nil)}
+        db #js {:transaction (fn [f] (f tx))}
+        error (try
+                (search/upsert-blocks! db (clj->js [{:id "not-uuid" :title "alpha" :page "not-uuid"}]))
+                nil
+                (catch :default e e))]
+    (is (some? error))
+    (is (re-find #"Search upsert-blocks wrong data"
+                 (or (ex-message error) (str error))))))
