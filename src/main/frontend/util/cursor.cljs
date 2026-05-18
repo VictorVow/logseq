@@ -141,6 +141,14 @@
           (when-let [pre-char (subs content (dec pos') pos')]
             (= pre-char \newline))))))
 
+(defn end-of-line?
+  [input]
+  (let [[content pos'] (get-input-content&pos input)]
+    (when content
+      (or (= pos' (count content))
+          (when-let [next-char (subs content pos' (inc pos'))]
+            (= next-char \newline))))))
+
 (comment
   (defn line-end-pos
     [input]
