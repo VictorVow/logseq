@@ -260,6 +260,12 @@
                                set)]
         (recur next-frontier seen-ids' id->title' (inc depth))))))
 
+(def ^:private max-expanded-title-length
+  "Mutually-referencing block titles grow exponentially on each replacement
+   pass, eventually exceeding the JS max string length (`RangeError: Invalid
+   string length`), so expansion stops once the result reaches this size."
+  10000)
+
 (defn recur-replace-uuid-in-block-title
   "Convert id ref (recursively) backs to page name refs, returns replaced title"
   ([ent]
@@ -273,6 +279,7 @@
        (let [id->title (block-ref-id->title ent max-depth replace-block-refs?)]
          (loop [result title depth 0]
            (if (or (>= depth max-depth)
+                   (> (count result) max-expanded-title-length)
                    (not (re-find id-ref-pattern result)))
              result
              (let [next-result (replace-title-refs-once result id->title)]

@@ -92,6 +92,21 @@
                :block/refs [{:block/uuid uuid-a
                              :block/title "tag with space"}]}))))
 
+    (testing "caps expansion of mutually-referencing titles"
+      ;; Two blocks whose titles reference each other multiple times grow
+      ;; exponentially per replacement pass; expansion must stay bounded
+      ;; instead of overflowing the JS max string length.
+      (let [pad (apply str (repeat 200 "x"))
+            title-a (str pad " " id-ref-b " " id-ref-b)
+            title-b (str pad " " id-ref-a " " id-ref-a)
+            result (db-content/recur-replace-uuid-in-block-title
+                    {:block/title title-a
+                     :block/refs [{:block/uuid uuid-a
+                                   :block/title title-a}
+                                  {:block/uuid uuid-b
+                                   :block/title title-b}]})]
+        (is (< (count result) 60000))))
+
     (testing "stops recursion when max-depth reached"
       (let [result (db-content/recur-replace-uuid-in-block-title
                     {:block/title id-ref-a
