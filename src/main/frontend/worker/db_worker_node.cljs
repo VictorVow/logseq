@@ -15,6 +15,7 @@
             [logseq.db :as ldb]
             [logseq.db-worker.log :as db-worker-log]
             [logseq.db-worker.server-list :as server-list]
+            [me.tonsky.persistent-sorted-set :as pss]
             [promesa.core :as p]))
 
 (defonce ^:private *ready? (atom false))
@@ -668,6 +669,9 @@
     (when-not (seq repo)
       (.error js/console "repo is required")
       (.exit js/process 1))
+    ;; Resident-graph mode (db-worker-node only): keep storage nodes strongly
+    ;; referenced so the graph isn't re-paged from sqlite under GC pressure.
+    (pss/set-strong-references! true)
     (-> (p/let [{:keys [stop!] :as daemon}
                 (start-daemon! {:root-dir root-dir
                                 :graphs-dir (:graphs-dir opts)
