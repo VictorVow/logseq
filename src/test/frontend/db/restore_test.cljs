@@ -37,9 +37,11 @@
                         (state/swap-state! assoc :git/current-repo repo')
                         nil)
                       state/<invoke-db-worker
-                      (fn [api repo']
+                      (fn [api repo' & _]
                         (swap! calls conj [:worker api repo'])
-                        (p/resolved conflicts-by-block))
+                        (p/resolved (if (= api :thread-api/pull)
+                                      {:logseq.property.journal/title-format "yyyy-MM-dd EEEE"}
+                                      conflicts-by-block)))
                       state/set-sync-block-conflicts!
                       (fn [& args]
                         (swap! calls conj (into [:hydrate] args)))
@@ -51,12 +53,15 @@
             (p/then
              (fn [_]
                (is (= [repo] @current-repos))
+               (is (= "yyyy-MM-dd EEEE" (state/get-date-formatter))
+                   "Restore loads the graph's journal title format.")
                (is (= [repo] @reset-graphs)
                    "A restored worker graph must reset renderer subscriptions before rendering it.")
                (is (= [[:graph/restored repo] [:ui/re-render-root]]
                       @events))
                (is (= [[:open repo]
                        [:worker :thread-api/db-sync-get-all-block-conflicts repo]
+                       [:worker :thread-api/pull repo]
                        [:current-repo repo]
                        [:reset repo]
                        [:hydrate repo conflicts-by-block]
