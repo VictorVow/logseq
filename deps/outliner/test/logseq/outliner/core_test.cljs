@@ -208,6 +208,42 @@
         (is (= canonical-uuid
                (:block/uuid (first (:block/refs (first (:blocks result)))))))))))
 
+(deftest insert-blocks-journal-ref-keeps-existing-journal-title
+  ;; Journals created under another title format keep that title and
+  ;; :block/name, so a ref typed in the current format misses the name lookup
+  ;; and must not rename the journal it resolves to by uuid.
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "host"}]}])
+        journal-day 20241216
+        canonical-uuid (common-uuid/gen-uuid :journal-page-uuid journal-day)
+        _ (outliner-page/create! conn "Dec 16th, 2024" {:journal? true})
+        _ (d/transact! conn [{:block/uuid canonical-uuid
+                              :block/title "2024-12-16 Monday"
+                              :block/name "2024-12-16 monday"}])
+        parsed-uuid (random-uuid)
+        host (db-test/find-block-by-content @conn "host")
+        result (outliner-core/insert-blocks
+                @conn
+                [{:block/uuid (random-uuid)
+                  :block/title (str "[[" parsed-uuid "]]")
+                  :block/raw-title (str "[[" parsed-uuid "]]")
+                  :block/refs [{:block/uuid parsed-uuid
+                                :block/title "Dec 16th, 2024"
+                                :block/name "dec 16th, 2024"
+                                :block/journal-day journal-day
+                                :block/tags [:logseq.class/Journal]}]}]
+                host
+                {:sibling? true
+                 :keep-uuid? true})
+        _ (d/transact! conn (:tx-data result))
+        journal (ldb/get-journal-page-by-day @conn journal-day)]
+    (is (= canonical-uuid (:block/uuid journal)))
+    (is (= "2024-12-16 Monday" (:block/title journal)))
+    (is (= "2024-12-16 monday" (:block/name journal)))
+    (is (= canonical-uuid
+           (:block/uuid (first (:block/refs (first (:blocks result)))))))))
+
 (deftest insert-blocks-missing-uuid-refs-become-broken
   ;; Both ref shapes produced for a uuid with no entity — a generated page map
   ;; and a [:block/uuid id] lookup — are dropped, and the title keeps the uuid

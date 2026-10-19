@@ -281,12 +281,21 @@
                                                                   :class? class?
                                                                   :journal? (or (= "journal" (:block/type ref))
                                                                                 (contains? (ref-tag-idents ref)
-                                                                                           :logseq.class/Journal))})]
-          [(cond-> (assoc (select-keys ref [:block/title :block/name :block.temp/original-page-name])
-                          :block/uuid page-uuid)
-             class? (assoc :db/ident (or (some :db/ident tx-data)
-                                         (:db/ident (d/entity db [:block/uuid page-uuid])))))
-           tx-data])))
+                                                                                           :logseq.class/Journal))})
+              existing-page (when (and page-uuid (empty? tx-data))
+                              (d/entity db [:block/uuid page-uuid]))]
+          (if existing-page
+            ;; create matched an existing page by uuid (e.g. a journal titled
+            ;; with another date format). Keep its title and name so the ref
+            ;; doesn't rename it.
+            [(merge (select-keys existing-page [:db/id :block/uuid :block/title :block/name :db/ident])
+                    (select-keys ref [:block.temp/original-page-name]))
+             nil]
+            [(cond-> (assoc (select-keys ref [:block/title :block/name :block.temp/original-page-name])
+                            :block/uuid page-uuid)
+               class? (assoc :db/ident (or (some :db/ident tx-data)
+                                           (:db/ident (d/entity db [:block/uuid page-uuid])))))
+             tx-data]))))
     [ref nil]))
 
 (defn- resolve-refs-dedup
