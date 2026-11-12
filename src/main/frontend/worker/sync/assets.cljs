@@ -36,6 +36,34 @@
   [asset-uuid asset-type]
   (str asset-uuid "." asset-type))
 
+;; shortcut: plugin sandbox assets are recognized from a relative
+;; `external-url`, which overloads it with a second meaning. The proper fix is
+;; https://github.com/logseq/logseq/pull/14003 (a dedicated `plugin-id`
+;; property, needs a schema migration); drop this once that lands.
+(def ^:private plugin-sandbox-external-url
+  #"^(?:\./)?assets/storages/([A-Za-z0-9_-][A-Za-z0-9._-]*)/([^/\\]+)$")
+
+(defn- plugin-sandbox-file-path
+  "Returns `storages/<plugin-id>/<uuid>.<ext>` when the asset's external-url
+  points at its own file in a plugin sandbox, else nil. The value arrives over
+  sync and becomes part of a write path, so the id must not contain separators
+  or start with a dot, and the file name must be the asset's own."
+  [asset-ent asset-type]
+  (let [file-name (asset-file-name (:block/uuid asset-ent) asset-type)]
+    (when-let [[_ plugin-id url-file-name]
+               (some->> (:logseq.property.asset/external-url asset-ent)
+                        str
+                        (re-matches plugin-sandbox-external-url))]
+      (when (= file-name url-file-name)
+        (str "storages/" plugin-id "/" file-name)))))
+
+(defn asset-file-path
+  "Path of the asset's file relative to the graph's assets dir."
+  [asset-ent]
+  (let [asset-type (:logseq.property.asset/type asset-ent)]
+    (or (plugin-sandbox-file-path asset-ent asset-type)
+        (asset-file-name (:block/uuid asset-ent) asset-type))))
+
 (defn- ->uint8
   [payload]
   (cond
@@ -83,19 +111,19 @@
                :total total}}))
 
 (defn- missing-asset-upload-file
-  [asset-id asset-type]
+  [asset-id asset-type file-path]
   {:asset-id asset-id
    :asset-type asset-type
-   :file (str common-config/local-assets-dir "/" (asset-file-name asset-id asset-type))})
+   :file (str common-config/local-assets-dir "/" file-path)})
 
 (defn- mark-missing-asset-upload-file!
-  [repo asset-id asset-type]
+  [repo asset-id asset-type file-path]
   (swap! *repo->missing-asset-upload-files
          update repo
          (fn [files]
            (assoc (or files {})
                   asset-id
-                  (missing-asset-upload-file asset-id asset-type))))
+                  (missing-asset-upload-file asset-id asset-type file-path))))
   nil)
 
 (defn- clear-missing-asset-upload-file!
@@ -128,22 +156,20 @@
     :ts (common-util/time-ms)}))
 
 (defn- <read-asset-bytes
-  [repo asset-id asset-type]
-  (platform/asset-read-bytes! (platform/current)
-                              repo
-                              (asset-file-name asset-id asset-type)))
+  [repo file-path]
+  (platform/asset-read-bytes! (platform/current) repo file-path))
 
 (defn- <write-asset-bytes!
-  [repo asset-id asset-type payload]
+  [repo asset-id file-path payload]
   (p/let [_ (platform/asset-write-bytes! (platform/current)
                                          repo
-                                         (asset-file-name asset-id asset-type)
+                                         file-path
                                          payload)]
     (mark-asset-write-finish! repo asset-id)
     nil))
 
 (defn upload-remote-asset!
-  [repo graph-id asset-uuid asset-type checksum]
+  [repo graph-id asset-uuid asset-type checksum file-path]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
     (if (and (seq base) (seq graph-id) (seq asset-type) (seq checksum))
       (-> (p/let [aes-key (graph-aes-key
@@ -153,10 +179,10 @@
                   asset-id (str asset-uuid)
                   put-url (sync-large-title/asset-url base graph-id asset-id asset-type)
                   asset-bytes (->
-                               (<read-asset-bytes repo asset-id asset-type)
+                               (<read-asset-bytes repo file-path)
                                (p/catch (fn [e]
                                           (log/error :read-asset-failed e)
-                                          (mark-missing-asset-upload-file! repo asset-id asset-type)
+                                          (mark-missing-asset-upload-file! repo asset-id asset-type file-path)
                                           (throw (ex-info "read-asset failed"
                                                           {:type :rtc.exception/read-asset-failed}
                                                           e)))))
@@ -255,7 +281,8 @@
               (p/resolved nil))
 
             :else
-            (-> (upload-remote-asset! repo graph-id asset-uuid asset-type checksum)
+            (-> (upload-remote-asset! repo graph-id asset-uuid asset-type checksum
+                                  (asset-file-path ent))
                 (p/then (fn [_]
                           (when (d/entity @conn [:block/uuid asset-uuid])
                             (ldb/transact!
@@ -359,7 +386,7 @@
         length))))
 
 (defn download-remote-asset!
-  [repo graph-id asset-uuid asset-type]
+  [repo graph-id asset-uuid asset-type file-path]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
     (if (and (seq base) (seq graph-id) (seq asset-type))
       (-> (p/let [aes-key (graph-aes-key
@@ -389,7 +416,7 @@
                     body
                     (let [asset-file-untransited (ldb/read-transit-str (.decode (js/TextDecoder.) body))]
                       (crypt/<decrypt-uint8array aes-key asset-file-untransited)))]
-            (<write-asset-bytes! repo asset-id asset-type asset-file))
+            (<write-asset-bytes! repo asset-id file-path asset-file))
           (p/catch
            (fn [e]
              (if (= :rtc.exception/download-asset-failed (:type (ex-data e)))
@@ -420,16 +447,14 @@
        #(when-let [conn (worker-state/get-datascript-conn repo)]
           (when-let [ent (d/entity @conn [:block/uuid asset-uuid])]
             (let [asset-type (:logseq.property.asset/type ent)
-                  asset-id (str asset-uuid)
                   should-download? (and (seq asset-type)
-                                        (:logseq.property.asset/remote-metadata ent))]
+                                        (:logseq.property.asset/remote-metadata ent))
+                  file-path (when should-download? (asset-file-path ent))]
               (-> (p/let [meta (when should-download?
-                                 (platform/asset-stat (platform/current)
-                                                      repo
-                                                      (asset-file-name asset-id asset-type)))
+                                 (platform/asset-stat (platform/current) repo file-path))
                           missing-local? (and should-download? (nil? meta))
                           _ (when missing-local?
-                              (download-remote-asset! repo graph-id asset-uuid asset-type))
+                              (download-remote-asset! repo graph-id asset-uuid asset-type file-path))
                           _ (when missing-local?
                               (client-op/remove-asset-op repo asset-uuid))
                           _ (when missing-local?
@@ -451,9 +476,11 @@
             db)
        (keep (fn [[e asset-uuid asset-type]]
                (let [ent (d/entity db e)]
-                 (when-not (seq (some-> (:logseq.property.asset/external-url ent) str))
+                 (when (or (not (seq (some-> (:logseq.property.asset/external-url ent) str)))
+                           (plugin-sandbox-file-path ent asset-type))
                    {:asset-uuid asset-uuid
-                    :asset-type asset-type}))))
+                    :asset-type asset-type
+                    :file-path (asset-file-path ent)}))))
        (sort-by (comp str :asset-uuid))))
 
 (defn download-remote-assets-if-missing!
@@ -480,23 +507,20 @@
                                   q)))
                        @selected))
         worker (fn worker []
-                 (if-let [{:keys [asset-uuid asset-type]} (pop-queue!)]
-                   (let [asset-id (str asset-uuid)]
-                     (-> (p/let [meta (platform/asset-stat current-platform
-                                                           repo
-                                                           (asset-file-name asset-id asset-type))
-                                 _ (if meta
-                                     (do
-                                       (swap! result update :skipped-existing inc)
-                                       nil)
-                                     (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type)]
-                                       (swap! result update :downloaded inc)))]
-                           nil)
-                         (p/catch (fn [e]
-                                    (swap! result update :failed inc)
-                                    (log-request-asset-download-failed! repo asset-uuid e)
-                                    nil))
-                         (p/then (fn [_] (worker)))))
+                 (if-let [{:keys [asset-uuid asset-type file-path]} (pop-queue!)]
+                   (-> (p/let [meta (platform/asset-stat current-platform repo file-path)
+                               _ (if meta
+                                   (do
+                                     (swap! result update :skipped-existing inc)
+                                     nil)
+                                   (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type file-path)]
+                                     (swap! result update :downloaded inc)))]
+                         nil)
+                       (p/catch (fn [e]
+                                  (swap! result update :failed inc)
+                                  (log-request-asset-download-failed! repo asset-uuid e)
+                                  nil))
+                       (p/then (fn [_] (worker))))
                    (p/resolved nil)))]
     (p/let [_ (p/all (mapv (fn [_] (worker))
                            (range (min remote-asset-download-parallelism
@@ -510,7 +534,8 @@
                (when (and (= (:a d) :logseq.property.asset/remote-metadata) (:added d))
                  (when-let [asset (d/entity db (:e d))]
                    {:asset-uuid (:block/uuid asset)
-                    :asset-type (:logseq.property.asset/type asset)}))))
+                    :asset-type (:logseq.property.asset/type asset)
+                    :file-path (asset-file-path asset)}))))
        distinct))
 
 (defn download-missing-remote-assets!

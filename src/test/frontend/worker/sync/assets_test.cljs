@@ -96,7 +96,7 @@
                                              (swap! broadcast-calls conj args))}))
                (p/then (fn [_]
                          (is (= [[repo (str asset-uuid ".png")]] @asset-stat-calls))
-                         (is (= [[repo graph-id asset-uuid "png"]] @download-calls))
+                         (is (= [[repo graph-id asset-uuid "png" (str asset-uuid ".png")]] @download-calls))
                          (is (= 1 (count @broadcast-calls)))))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
@@ -158,7 +158,7 @@
                                sync-presence/rtc-state-payload (fn [& _args] {})
                                sync-assets/log-request-asset-download-failed! (fn [& _args] nil)
                                sync-assets/download-remote-asset!
-                               (fn [_repo _graph-id asset-uuid _asset-type]
+                               (fn [_repo _graph-id asset-uuid _asset-type _file-path]
                                  (swap! download-calls conj asset-uuid)
                                  (if (= missing-uuid asset-uuid)
                                    (p/rejected (ex-info "download asset failed"
@@ -215,7 +215,7 @@
                                shared-service/broadcast-to-clients!
                                (fn [& _] nil)]
                  (sync-assets/upload-remote-asset!
-                  repo graph-id asset-uuid "png" checksum))
+                  repo graph-id asset-uuid "png" checksum (str asset-uuid ".png")))
                (p/then
                 (fn [_]
                   (is (instance? js/Uint8Array @encrypt-input*))
@@ -261,7 +261,7 @@
                                  (swap! broadcasts conj [event payload]))]
                  (sync-assets/clear-missing-asset-upload-files! repo)
                  (sync-assets/upload-remote-asset!
-                  repo graph-id asset-uuid "pdf" checksum))
+                  repo graph-id asset-uuid "pdf" checksum (str asset-uuid ".pdf")))
                (p/then
                 (fn [_]
                   (is false "expected missing local file to reject")))
@@ -289,6 +289,8 @@
                existing-uuid (random-uuid)
                local-uuid (random-uuid)
                external-uuid (random-uuid)
+               sandbox-uuid (random-uuid)
+               unsafe-sandbox-uuid (random-uuid)
                conn (d/create-conn db-schema/schema)
                stat-calls (atom [])
                download-calls (atom [])]
@@ -317,7 +319,21 @@
               :logseq.property.asset/checksum "external-checksum"
               :logseq.property.asset/remote-metadata {:checksum "external-checksum"
                                                       :type "gif"}
-              :logseq.property.asset/external-url "https://example.com/asset.gif"}])
+              :logseq.property.asset/external-url "https://example.com/asset.gif"}
+             {:block/uuid sandbox-uuid
+              :block/tags #{:logseq.class/Asset}
+              :logseq.property.asset/type "jpg"
+              :logseq.property.asset/checksum "sandbox-checksum"
+              :logseq.property.asset/remote-metadata {:checksum "sandbox-checksum"
+                                                      :type "jpg"}
+              :logseq.property.asset/external-url (str "./assets/storages/plugin-a/" sandbox-uuid ".jpg")}
+             {:block/uuid unsafe-sandbox-uuid
+              :block/tags #{:logseq.class/Asset}
+              :logseq.property.asset/type "jpg"
+              :logseq.property.asset/checksum "unsafe-checksum"
+              :logseq.property.asset/remote-metadata {:checksum "unsafe-checksum"
+                                                      :type "jpg"}
+              :logseq.property.asset/external-url (str "./assets/storages/../" unsafe-sandbox-uuid ".jpg")}])
            (-> (p/with-redefs [worker-state/get-datascript-conn (fn [_repo]
                                                                   conn)
                                platform/current (fn [] {})
@@ -332,16 +348,19 @@
                                  (p/resolved nil))]
                  (sync-assets/download-missing-remote-assets! repo graph-id))
                (p/then (fn [result]
-                         (is (= {:total 2
-                                 :downloaded 1
+                         (is (= {:total 3
+                                 :downloaded 2
                                  :skipped-existing 1
                                  :failed 0}
                                 result))
                          (is (= #{[repo (str existing-uuid ".pdf")]
-                                  [repo (str missing-uuid ".png")]}
+                                  [repo (str missing-uuid ".png")]
+                                  [repo (str "storages/plugin-a/" sandbox-uuid ".jpg")]}
                                 (set @stat-calls)))
-                         (is (= [[repo graph-id missing-uuid "png"]]
-                                @download-calls))))
+                         (is (= #{[repo graph-id missing-uuid "png" (str missing-uuid ".png")]
+                                  [repo graph-id sandbox-uuid "jpg" (str "storages/plugin-a/" sandbox-uuid ".jpg")]}
+                                (set @download-calls))
+                             "plugin sandbox assets download to their sandbox path; unsafe ones are skipped")))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))
@@ -353,9 +372,11 @@
                failed-uuid (random-uuid)
                ok-uuid (random-uuid)
                candidates [{:asset-uuid failed-uuid
-                            :asset-type "png"}
+                            :asset-type "png"
+                            :file-path (str failed-uuid ".png")}
                            {:asset-uuid ok-uuid
-                            :asset-type "png"}]
+                            :asset-type "png"
+                            :file-path (str ok-uuid ".png")}]
                download-calls (atom [])
                log-calls (atom [])]
            (-> (p/with-redefs [platform/current (fn [] {})
@@ -366,7 +387,7 @@
                                (fn [repo' asset-uuid' error']
                                  (swap! log-calls conj [repo' asset-uuid' error']))
                                sync-assets/download-remote-asset!
-                               (fn [_repo _graph-id asset-uuid _asset-type]
+                               (fn [_repo _graph-id asset-uuid _asset-type _file-path]
                                  (swap! download-calls conj asset-uuid)
                                  (if (= failed-uuid asset-uuid)
                                    (p/rejected (ex-info "download asset failed"
@@ -395,8 +416,10 @@
          (let [repo "asset-prefetch-repo"
                graph-id "graph-1"
                candidates (mapv (fn [_]
-                                   {:asset-uuid (random-uuid)
-                                    :asset-type "png"})
+                                   (let [asset-uuid (random-uuid)]
+                                     {:asset-uuid asset-uuid
+                                      :asset-type "png"
+                                      :file-path (str asset-uuid ".png")}))
                                  (range 12))
                active-downloads (atom 0)
                max-active-downloads (atom 0)
@@ -406,7 +429,7 @@
                                (fn [_platform _repo _file-name]
                                  (p/resolved nil))
                                sync-assets/download-remote-asset!
-                               (fn [repo' graph-id' asset-uuid asset-type]
+                               (fn [repo' graph-id' asset-uuid asset-type _file-path]
                                  (swap! download-calls conj [repo' graph-id' asset-uuid asset-type])
                                  (let [active (swap! active-downloads inc)]
                                    (swap! max-active-downloads max active))
@@ -426,3 +449,26 @@
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))
+
+(deftest asset-file-path-test
+  (let [asset-uuid (random-uuid)
+        asset (fn [external-url]
+                (cond-> {:block/uuid asset-uuid
+                         :logseq.property.asset/type "png"}
+                  external-url (assoc :logseq.property.asset/external-url external-url)))
+        own-file (str asset-uuid ".png")]
+    (is (= own-file (sync-assets/asset-file-path (asset nil))))
+    (is (= own-file (sync-assets/asset-file-path (asset "https://example.com/a.png"))))
+    (is (= (str "storages/plugin-a/" own-file)
+           (sync-assets/asset-file-path (asset (str "./assets/storages/plugin-a/" own-file)))))
+    (is (= (str "storages/p.b_c-1/" own-file)
+           (sync-assets/asset-file-path (asset (str "assets/storages/p.b_c-1/" own-file)))))
+    (doseq [unsafe-url [(str "./assets/storages/../" own-file)
+                        (str "./assets/storages/./" own-file)
+                        (str "./assets/storages/.hidden/" own-file)
+                        (str "./assets/storages/a/b/" own-file)
+                        (str "./assets/storages/a\\b/" own-file)
+                        (str "./assets/storages//" own-file)
+                        "./assets/storages/plugin-a/other.png"]]
+      (is (= own-file (sync-assets/asset-file-path (asset unsafe-url)))
+          unsafe-url))))

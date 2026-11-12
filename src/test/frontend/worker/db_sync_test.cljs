@@ -3543,7 +3543,7 @@
                                      client-ops-conn
                                      (get-client-ops-conn repo*)))
                                  sync-assets/upload-remote-asset!
-                                 (fn [_repo _graph-id asset-uuid _asset-type _checksum]
+                                 (fn [_repo _graph-id asset-uuid _asset-type _checksum _file-path]
                                    (swap! upload-calls conj asset-uuid)
                                    (if (and (= missing-asset-uuid asset-uuid)
                                             (not @restored?))
